@@ -28,5 +28,5 @@ Raft lets a cluster of nodes agree on an ordered log of commands and survive the
 | Behavioral parity vs tikv/raft-rs | ✅ |
 
 ```shell
-dotnet add package Raft
+dotnet add package RaftCs
 ```

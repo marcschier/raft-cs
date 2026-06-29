@@ -45,7 +45,7 @@ jobs:
             | head -n1)
           base=${base%/}
           mkdir -p ./download
-          for id in Raft Raft.Transport Raft.Transport.NanoMsg Raft.Storage.File; do
+          for id in RaftCs RaftCs.Transport RaftCs.Transport.NanoMsg RaftCs.Storage.File; do
             lower=$(echo "$id" | tr '[:upper:]' '[:lower:]')
             if [ -n "${VERSION}" ]; then
               ver="${VERSION}"

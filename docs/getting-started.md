@@ -3,10 +3,10 @@
 ## Install
 
 ```shell
-dotnet add package Raft
-dotnet add package Raft.Transport            # in-memory transport + IRaftTransport
-dotnet add package Raft.Transport.NanoMsg    # optional: NNG/nanomsg transport
-dotnet add package Raft.Storage.File         # optional: crash-safe file (WAL) storage
+dotnet add package RaftCs
+dotnet add package RaftCs.Transport            # in-memory transport + IRaftTransport
+dotnet add package RaftCs.Transport.NanoMsg    # optional: NNG/nanomsg transport
+dotnet add package RaftCs.Storage.File         # optional: crash-safe file (WAL) storage
 ```
 
 ## Run a three-node cluster
@@ -65,7 +65,7 @@ await leader.TransferLeadershipAsync(targetId: 2);
 
 ## Persist across restarts
 
-Swap `MemoryStorage` for `FileRaftStorage` (package `Raft.Storage.File`) to durably persist the log, hard state, and snapshots:
+Swap `MemoryStorage` for `FileRaftStorage` (package `RaftCs.Storage.File`) to durably persist the log, hard state, and snapshots:
 
 ```csharp
 using var storage = new FileRaftStorage(new FileRaftStorageOptions { Directory = "/var/lib/raft/node1" });

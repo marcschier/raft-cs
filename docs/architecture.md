@@ -32,7 +32,7 @@ Raft separates a **deterministic consensus core** from the **I/O that drives it*
 `IRaftStorage` is the read side (the raft-rs `Storage` trait analog); `IRaftWritableStorage` adds append/compact/snapshot/hard-state writes used by the driver. Two implementations ship:
 
 - **`MemoryStorage`** — volatile, with a sentinel entry marking the compacted boundary.
-- **`FileRaftStorage`** (package `Raft.Storage.File`) — a crash-safe append-only WAL plus hard-state and snapshot files, replayed on open and tolerant of a torn trailing record.
+- **`FileRaftStorage`** (package `RaftCs.Storage.File`) — a crash-safe append-only WAL plus hard-state and snapshot files, replayed on open and tolerant of a torn trailing record.
 
 ## Membership — joint consensus
 
@@ -46,8 +46,8 @@ Configuration is a `JointConfig` of an incoming and outgoing `MajorityConfig`; a
 
 `IRaftTransport` delivers opaque, encoded message frames between nodes. Implementations:
 
-- **`InMemoryNetwork`/`InMemoryTransport`** (package `Raft.Transport`) — a deterministic in-process bus with optional loss and partition injection for tests.
-- **`NanoMsgBusTransport`** (package `Raft.Transport.NanoMsg`) — a BUS-topology transport over NanoMsgSharp (managed nanomsg/NNG over tcp, tls, ipc, ws, inproc). The consensus layer filters frames by recipient id.
+- **`InMemoryNetwork`/`InMemoryTransport`** (package `RaftCs.Transport`) — a deterministic in-process bus with optional loss and partition injection for tests.
+- **`NanoMsgBusTransport`** (package `RaftCs.Transport.NanoMsg`) — a BUS-topology transport over NanoMsgSharp (managed nanomsg/NNG over tcp, tls, ipc, ws, inproc). The consensus layer filters frames by recipient id.
 
 ## Performance
 

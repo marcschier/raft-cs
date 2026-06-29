@@ -1,6 +1,6 @@
 # 🧭 Raft
 
-[![CI](https://github.com/marcschier/raft-cs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/marcschier/raft-cs/actions/workflows/ci.yml) [![NuGet](https://img.shields.io/nuget/v/Raft?logo=nuget&label=NuGet)](https://www.nuget.org/packages/Raft) [![GitHub Packages](https://img.shields.io/badge/GitHub%20Packages-Raft-2088FF?logo=github&logoColor=white)](https://github.com/marcschier/raft-cs/pkgs/nuget/Raft)
+[![CI](https://github.com/marcschier/raft-cs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/marcschier/raft-cs/actions/workflows/ci.yml) [![NuGet](https://img.shields.io/nuget/v/RaftCs?logo=nuget&label=NuGet)](https://www.nuget.org/packages/RaftCs) [![GitHub Packages](https://img.shields.io/badge/GitHub%20Packages-RaftCs-2088FF?logo=github&logoColor=white)](https://github.com/marcschier/raft-cs/pkgs/nuget/RaftCs)
 
 A pure-managed, **NativeAOT-ready** implementation of the **[Raft consensus algorithm](https://raft.github.io/)** for modern .NET. No native dependency.
 
@@ -18,15 +18,15 @@ A pure-managed, **NativeAOT-ready** implementation of the **[Raft consensus algo
 ## 📦 Install
 
 ```shell
-dotnet add package Raft
+dotnet add package RaftCs
 ```
 
 Replaceable transport and storage ship as separate opt-in packages:
 
 ```shell
-dotnet add package Raft.Transport            # IRaftTransport + in-memory transport
-dotnet add package Raft.Transport.NanoMsg    # NNG/nanomsg (BUS) transport
-dotnet add package Raft.Storage.File         # crash-safe file (WAL) IRaftStorage
+dotnet add package RaftCs.Transport            # IRaftTransport + in-memory transport
+dotnet add package RaftCs.Transport.NanoMsg    # NNG/nanomsg (BUS) transport
+dotnet add package RaftCs.Storage.File         # crash-safe file (WAL) IRaftStorage
 ```
 
 ## 🚀 Quick start

@@ -45,16 +45,16 @@ The deterministic engine, for embedding in a custom driver (the raft-rs `RawNode
 | --- | --- |
 | `IRaftStorage` | Read side: `InitialState`, `Entries`, `Term`, `FirstIndex`, `LastIndex`, `Snapshot`. |
 | `IRaftWritableStorage` | Adds `Append`, `ApplySnapshot`, `Compact`, `SetHardState`, `SetConfState`. |
-| `MemoryStorage` | Volatile in-memory store (package `Raft`). |
-| `FileRaftStorage` / `FileRaftStorageOptions` | Crash-safe file (WAL) store (package `Raft.Storage.File`). |
+| `MemoryStorage` | Volatile in-memory store (package `RaftCs`). |
+| `FileRaftStorage` / `FileRaftStorageOptions` | Crash-safe file (WAL) store (package `RaftCs.Storage.File`). |
 
 ## Transport
 
 | Type | Description |
 | --- | --- |
 | `IRaftTransport` | `StartAsync`, `SendAsync(recipient, frame)`, `FrameReceived`. |
-| `InMemoryNetwork` / `InMemoryTransport` | In-process bus with loss/partition injection (package `Raft.Transport`). |
-| `NanoMsgBusTransport` / `NanoMsgBusTransportOptions` | NNG/nanomsg BUS transport (package `Raft.Transport.NanoMsg`). |
+| `InMemoryNetwork` / `InMemoryTransport` | In-process bus with loss/partition injection (package `RaftCs.Transport`). |
+| `NanoMsgBusTransport` / `NanoMsgBusTransportOptions` | NNG/nanomsg BUS transport (package `RaftCs.Transport.NanoMsg`). |
 
 ## Membership
 
