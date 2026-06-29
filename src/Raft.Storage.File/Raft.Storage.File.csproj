@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net8.0;net9.0;net10.0</TargetFrameworks>
+    <RootNamespace>Raft.Storage.File</RootNamespace>
+    <AssemblyName>Raft.Storage.File</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <BuildProjectReferences>false</BuildProjectReferences>
+    <Description>A simple crash-safe append-only file (WAL/segment) implementation of the Raft IRaftStorage abstraction, persisting log entries, hard state, and snapshots.</Description>
+    <PackageTags>raft;consensus;storage;wal;persistence;aot</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Raft\Raft.csproj" AdditionalProperties="NoWarn=$(NoWarn);CA1512;CS1574" />
+  </ItemGroup>
+
+</Project>

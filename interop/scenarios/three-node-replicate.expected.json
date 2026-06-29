@@ -1,0 +1,31 @@
+{
+  "name": "three-node-replicate",
+  "leader": 1,
+  "term": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "committed": [
+        "x=1",
+        "y=2",
+        "z=3"
+      ]
+    },
+    {
+      "id": 2,
+      "committed": [
+        "x=1",
+        "y=2",
+        "z=3"
+      ]
+    },
+    {
+      "id": 3,
+      "committed": [
+        "x=1",
+        "y=2",
+        "z=3"
+      ]
+    }
+  ]
+}

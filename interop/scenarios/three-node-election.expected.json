@@ -1,0 +1,19 @@
+{
+  "name": "three-node-election",
+  "leader": 1,
+  "term": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "committed": []
+    },
+    {
+      "id": 2,
+      "committed": []
+    },
+    {
+      "id": 3,
+      "committed": []
+    }
+  ]
+}

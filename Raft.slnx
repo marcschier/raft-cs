@@ -1,0 +1,29 @@
+<Solution>
+  <Folder Name="/solution/">
+    <File Path=".editorconfig" />
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="version.json" />
+    <File Path="global.json" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Raft/Raft.csproj" />
+    <Project Path="src/Raft.Transport/Raft.Transport.csproj" />
+    <Project Path="src/Raft.Transport.NanoMsg/Raft.Transport.NanoMsg.csproj" />
+    <Project Path="src/Raft.Storage.File/Raft.Storage.File.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Raft.Tests/Raft.Tests.csproj" />
+    <Project Path="tests/Raft.Transport.Tests/Raft.Transport.Tests.csproj" />
+    <Project Path="tests/Raft.Transport.NanoMsg.Tests/Raft.Transport.NanoMsg.Tests.csproj" />
+    <Project Path="tests/Raft.Storage.File.Tests/Raft.Storage.File.Tests.csproj" />
+    <Project Path="tests/Raft.Interop.Tests/Raft.Interop.Tests.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/Raft.Samples/Raft.Samples.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="tests/Raft.Benchmarks/Raft.Benchmarks.csproj" />
+  </Folder>
+</Solution>

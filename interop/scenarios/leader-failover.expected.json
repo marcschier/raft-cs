@@ -1,0 +1,28 @@
+{
+  "name": "leader-failover",
+  "leader": 2,
+  "term": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "committed": [
+        "before-failover",
+        "after-failover"
+      ]
+    },
+    {
+      "id": 2,
+      "committed": [
+        "before-failover",
+        "after-failover"
+      ]
+    },
+    {
+      "id": 3,
+      "committed": [
+        "before-failover",
+        "after-failover"
+      ]
+    }
+  ]
+}

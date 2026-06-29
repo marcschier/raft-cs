@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net8.0;net9.0;net10.0</TargetFrameworks>
+    <PackageId>Raft</PackageId>
+    <RootNamespace>Raft</RootNamespace>
+    <AssemblyName>Raft</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Description>High-performance, NativeAOT-ready Raft consensus (https://raft.github.io) for modern .NET — a customizable core consensus module (election, log replication, snapshots, joint membership) with replaceable storage and transport, modeled on tikv/raft-rs.</Description>
+    <PackageTags>raft;consensus;distributed-systems;replication;state-machine;leader-election;aot;span;high-performance</PackageTags>
+  </PropertyGroup>
+
+  <!-- Core async surface (RaftNode) needs Channels/async interfaces on netstandard. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' OR '$(TargetFramework)' == 'netstandard2.1'">
+    <PackageReference Include="System.Threading.Channels" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" />
+    <PackageReference Include="System.Threading.Tasks.Extensions" />
+  </ItemGroup>
+
+</Project>

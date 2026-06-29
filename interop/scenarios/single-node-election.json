@@ -1,0 +1,27 @@
+{
+  "name": "single-node-election",
+  "nodes": [1],
+  "election_ticks": {
+    "1": 10
+  },
+  "heartbeat_ticks": 3,
+  "steps": [
+    {
+      "op": "campaign",
+      "node": 1
+    },
+    {
+      "op": "propose",
+      "node": 1,
+      "command": "x=1"
+    },
+    {
+      "op": "propose",
+      "node": 1,
+      "command": "y=2"
+    },
+    {
+      "op": "deliver"
+    }
+  ]
+}

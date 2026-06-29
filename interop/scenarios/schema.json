@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/raft-interop-scenario.schema.json",
+  "title": "Raft behavioral-parity scenario",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "nodes", "election_ticks", "heartbeat_ticks", "steps"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "election_ticks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "propertyNames": {
+        "pattern": "^[1-9][0-9]*$"
+      }
+    },
+    "heartbeat_ticks": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op", "node"],
+            "properties": {
+              "op": {
+                "const": "campaign"
+              },
+              "node": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op", "node", "count"],
+            "properties": {
+              "op": {
+                "const": "tick"
+              },
+              "node": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op", "count"],
+            "properties": {
+              "op": {
+                "const": "tick_all"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op", "node", "command"],
+            "properties": {
+              "op": {
+                "const": "propose"
+              },
+              "node": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "command": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op"],
+            "properties": {
+              "op": {
+                "const": "deliver"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op", "nodes"],
+            "properties": {
+              "op": {
+                "const": "isolate"
+              },
+              "nodes": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op"],
+            "properties": {
+              "op": {
+                "const": "heal"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

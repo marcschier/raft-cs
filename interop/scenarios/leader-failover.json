@@ -1,0 +1,56 @@
+{
+  "name": "leader-failover",
+  "nodes": [1, 2, 3],
+  "election_ticks": {
+    "1": 10,
+    "2": 15,
+    "3": 20
+  },
+  "heartbeat_ticks": 3,
+  "steps": [
+    {
+      "op": "tick_all",
+      "count": 11
+    },
+    {
+      "op": "deliver"
+    },
+    {
+      "op": "propose",
+      "node": 1,
+      "command": "before-failover"
+    },
+    {
+      "op": "deliver"
+    },
+    {
+      "op": "isolate",
+      "nodes": [1]
+    },
+    {
+      "op": "tick_all",
+      "count": 16
+    },
+    {
+      "op": "deliver"
+    },
+    {
+      "op": "propose",
+      "node": 2,
+      "command": "after-failover"
+    },
+    {
+      "op": "deliver"
+    },
+    {
+      "op": "heal"
+    },
+    {
+      "op": "tick_all",
+      "count": 6
+    },
+    {
+      "op": "deliver"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net8.0;net9.0;net10.0</TargetFrameworks>
+    <RootNamespace>Raft.Transport</RootNamespace>
+    <AssemblyName>Raft.Transport</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>$(NoWarn);CA1510;CA1513;CA1716</NoWarn>
+    <Description>Replaceable transport layer for Raft: the IRaftTransport abstraction, length-prefixed framing, and an in-memory transport/network for deterministic, network-free testing.</Description>
+    <PackageTags>raft;consensus;transport;in-memory;replication;aot</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Raft\Raft.csproj" AdditionalProperties="NoWarn=CA1512;CS1574" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' OR '$(TargetFramework)' == 'netstandard2.1'">
+    <PackageReference Include="System.Threading.Channels" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" />
+    <PackageReference Include="System.Threading.Tasks.Extensions" />
+  </ItemGroup>
+
+</Project>
