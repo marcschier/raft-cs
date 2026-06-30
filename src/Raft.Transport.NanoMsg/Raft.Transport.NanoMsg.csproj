@@ -5,9 +5,6 @@
     <PackageId>RaftCs.Transport.NanoMsg</PackageId>
     <RootNamespace>Raft.Transport.NanoMsg</RootNamespace>
     <AssemblyName>Raft.Transport.NanoMsg</AssemblyName>
-    <!-- CS8002: this signed assembly references the unsigned NanoMsgSharp package — harmless on
-         modern .NET (strong-name verification is skipped). -->
-    <NoWarn>$(NoWarn);CS8002</NoWarn>
     <Description>Scalability-Protocols (BUS/PAIR) Raft transport built on NanoMsgSharp (managed nanomsg/NNG over tcp, tls, ipc, ws, and inproc).</Description>
     <PackageTags>raft;consensus;transport;nanomsg;nng;scalability-protocols</PackageTags>
   </PropertyGroup>

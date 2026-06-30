@@ -39,7 +39,7 @@
 
   <!-- Scalability-protocols (nanomsg/NNG) transport -->
   <ItemGroup>
-    <PackageVersion Include="NanoMsgSharp" Version="1.0.0" />
+    <PackageVersion Include="NanoMsgSharp" Version="1.1.0" />
   </ItemGroup>
 
 </Project>
