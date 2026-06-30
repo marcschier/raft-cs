@@ -37,6 +37,8 @@ struct Scenario {
     nodes: Vec<u64>,
     election_ticks: BTreeMap<String, usize>,
     heartbeat_ticks: usize,
+    #[serde(default)]
+    check_quorum: bool,
     steps: Vec<Step>,
 }
 
@@ -101,7 +103,7 @@ impl Harness {
                 max_election_tick: election_tick + 1,
                 max_size_per_msg: 1_048_576,
                 max_inflight_msgs: 256,
-                check_quorum: false,
+                check_quorum: scenario.check_quorum,
                 pre_vote: false,
                 ..Config::default()
             };

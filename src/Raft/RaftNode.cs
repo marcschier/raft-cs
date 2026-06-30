@@ -114,7 +114,7 @@ public sealed class RaftNode : IAsyncDisposable
     /// <summary>Gets this node's highest committed index.</summary>
     public ulong CommitIndex => (ulong)Interlocked.Read(ref _commitIndex);
 
-    /// <summary>Gets the highest log index applied to the state machine and surfaced through <see cref="Committed"/>.</summary>
+    /// <summary>Gets the highest log index applied and delivered through <see cref="Committed"/>.</summary>
     public ulong AppliedIndex => (ulong)Interlocked.Read(ref _appliedIndex);
 
     /// <summary>Gets the current role.</summary>
@@ -239,7 +239,7 @@ public sealed class RaftNode : IAsyncDisposable
     /// <param name="index">The first index to retain; must not exceed <see cref="AppliedIndex"/>.</param>
     /// <param name="cancellationToken">A token that cancels the wait (the compaction itself still completes).</param>
     /// <returns>A task that completes when the log has been compacted.</returns>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> exceeds <see cref="AppliedIndex"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is past the applied index.</exception>
     public Task CompactAsync(ulong index, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();

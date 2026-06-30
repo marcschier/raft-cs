@@ -1,0 +1,27 @@
+{
+  "name": "forward-proposal",
+  "nodes": [1, 2, 3],
+  "election_ticks": {
+    "1": 10,
+    "2": 15,
+    "3": 20
+  },
+  "heartbeat_ticks": 3,
+  "steps": [
+    {
+      "op": "tick_all",
+      "count": 11
+    },
+    {
+      "op": "deliver"
+    },
+    {
+      "op": "propose",
+      "node": 2,
+      "command": "via-follower"
+    },
+    {
+      "op": "deliver"
+    }
+  ]
+}

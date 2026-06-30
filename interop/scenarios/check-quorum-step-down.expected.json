@@ -1,0 +1,19 @@
+{
+  "name": "check-quorum-step-down",
+  "leader": 0,
+  "term": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "committed": []
+    },
+    {
+      "id": 2,
+      "committed": []
+    },
+    {
+      "id": 3,
+      "committed": []
+    }
+  ]
+}
