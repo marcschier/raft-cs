@@ -11,7 +11,7 @@ public sealed partial class RaftCore
 {
     /// <summary>Appends entries to the local log as the leader, stamping term and contiguous indices.</summary>
     /// <param name="entries">The entries to append (term/index are assigned here).</param>
-    /// <returns><see langword="true"/> when accepted; <see langword="false"/> when rejected by the uncommitted cap.</returns>
+    /// <returns><see langword="true"/> when accepted, or <see langword="false"/> when the cap rejects it.</returns>
     internal bool AppendEntries(IReadOnlyList<Entry> entries)
     {
         ulong lastIndex = _log.LastIndex();

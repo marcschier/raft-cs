@@ -27,7 +27,7 @@ public sealed class Inflights
 
     /// <summary>Initializes a new instance of the <see cref="Inflights"/> class.</summary>
     /// <param name="capacity">The maximum number of in-flight appends.</param>
-    /// <param name="maxBytes">The maximum total payload bytes in flight (<see cref="ulong.MaxValue"/> = unlimited).</param>
+    /// <param name="maxBytes">The maximum payload bytes in flight (<see cref="ulong.MaxValue"/> = unlimited).</param>
     public Inflights(int capacity, ulong maxBytes = ulong.MaxValue)
     {
 #if NET8_0_OR_GREATER
@@ -45,7 +45,8 @@ public sealed class Inflights
     }
 
     /// <summary>Gets a value indicating whether the window is full (by message count or byte budget).</summary>
-    public bool IsFull => _count == _buffer.Length || (_maxBytes != ulong.MaxValue && _count > 0 && _bytes >= _maxBytes);
+    public bool IsFull =>
+        _count == _buffer.Length || (_maxBytes != ulong.MaxValue && _count > 0 && _bytes >= _maxBytes);
 
     /// <summary>Gets the number of in-flight appends.</summary>
     public int Count => _count;

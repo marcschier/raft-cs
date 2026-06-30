@@ -481,7 +481,7 @@ public sealed class RaftNode : IAsyncDisposable
 #endif
     }
 
-    /// <summary>Loop signal posted by the storage worker when a <see cref="StorageWrite"/> has been made durable.</summary>
+    /// <summary>Loop signal posted by the storage worker once a <see cref="StorageWrite"/> is durable.</summary>
     private sealed class AppendComplete
     {
         internal AppendComplete(StorageWrite write) => Write = write;

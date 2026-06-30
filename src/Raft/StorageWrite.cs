@@ -41,7 +41,7 @@ public sealed class StorageWrite
     /// <summary>Gets the unstable log entries to append, in index order.</summary>
     public IReadOnlyList<Entry> Entries { get; }
 
-    /// <summary>Gets the hard state to persist, or <see langword="null"/> when it is unchanged since the last write.</summary>
+    /// <summary>Gets the hard state to persist, or <see langword="null"/> when unchanged.</summary>
     public HardState? HardState { get; }
 
     /// <summary>Gets the snapshot to install, or <see langword="null"/> when none is pending.</summary>
@@ -59,6 +59,6 @@ public sealed class StorageWrite
     /// <summary>Gets the index of the pending <see cref="Snapshot"/>, or zero when none.</summary>
     public ulong SnapshotIndex { get; }
 
-    /// <summary>Gets a value indicating whether this write carries durable state (entries, hard state, or a snapshot).</summary>
+    /// <summary>Gets whether this write carries durable state (entries, hard state, or snapshot).</summary>
     public bool HasPersistentWork => Entries.Count > 0 || HardState is not null || Snapshot is not null;
 }
