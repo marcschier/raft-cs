@@ -536,6 +536,11 @@ public sealed class RaftNode : IAsyncDisposable
                 catch (OperationCanceledException)
                 {
                 }
+                catch (Exception)
+                {
+                    // Best-effort: a failed batch send is a dropped message (Raft retransmits) and must
+                    // never fault the driver loop — e.g. a peer's transport closing during cluster shutdown.
+                }
             }
 
             return;
@@ -560,6 +565,12 @@ public sealed class RaftNode : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+        }
+        catch (Exception)
+        {
+            // A failed send is a dropped message, which Raft recovers from by retransmission. A peer whose
+            // transport has already closed (e.g. during cluster shutdown) must never fault the driver loop
+            // and surface out of DisposeAsync.
         }
     }
 
