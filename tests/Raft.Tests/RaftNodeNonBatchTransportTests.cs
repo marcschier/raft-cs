@@ -7,10 +7,10 @@ using Raft.Transport;
 
 namespace Raft.Tests;
 
-public sealed class RaftNodeAsyncStorageTests
+public sealed class RaftNodeNonBatchTransportTests
 {
     [Test]
-    public async Task FollowerForwardsProposalToLeaderOverTransport()
+    public async Task ReplicatesOverTransportThatDoesNotSupportBatching()
     {
         ulong[] ids = { 1, 2, 3 };
         await using var network = new InMemoryNetwork();
@@ -19,6 +19,9 @@ public sealed class RaftNodeAsyncStorageTests
         {
             foreach (ulong id in ids)
             {
+                // Wrap the batch-capable in-memory transport so the node only sees IRaftTransport, forcing the
+                // driver's per-frame SendAsync fallback.
+                IRaftTransport transport = new NonBatchTransport(network.CreateNode(id));
                 var node = new RaftNode(
                     new RaftConfig
                     {
@@ -28,7 +31,7 @@ public sealed class RaftNodeAsyncStorageTests
                         RandomizedElectionTimeout = id == 1 ? 6 : 18,
                     },
                     new MemoryStorage(new ConfState(ids)),
-                    network.CreateNode(id),
+                    transport,
                     new RaftNodeOptions { TickInterval = TimeSpan.FromMilliseconds(10) });
                 nodes.Add(node);
             }
@@ -39,16 +42,13 @@ public sealed class RaftNodeAsyncStorageTests
             }
 
             RaftNode leader = await WaitForLeaderAsync(nodes);
-            RaftNode follower = nodes.First(n => !n.IsLeader);
-            await WaitUntilAsync(() => follower.LeaderId == leader.Id);
-
-            // Propose to a follower: it must internally forward the proposal to the leader.
-            await follower.ProposeAsync(Encoding.UTF8.GetBytes("forwarded"));
+            await leader.ProposeAsync(Encoding.UTF8.GetBytes("nb"));
 
             foreach (RaftNode node in nodes)
             {
-                string command = await ReadOneCommittedAsync(node);
-                await Assert.That(command).IsEqualTo("forwarded");
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                ReadOnlyMemory<byte> command = await node.Committed.ReadAsync(timeout.Token);
+                await Assert.That(Encoding.UTF8.GetString(command.ToArray())).IsEqualTo("nb");
             }
         }
         finally
@@ -79,19 +79,28 @@ public sealed class RaftNodeAsyncStorageTests
         throw new TimeoutException("No leader was elected.");
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition)
+    /// <summary>An <see cref="IRaftTransport"/> wrapper that deliberately does not implement batch sending.</summary>
+    private sealed class NonBatchTransport : IRaftTransport
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        while (!condition())
-        {
-            await Task.Delay(10, timeout.Token);
-        }
-    }
+        private readonly IRaftTransport _inner;
 
-    private static async Task<string> ReadOneCommittedAsync(RaftNode node)
-    {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        ReadOnlyMemory<byte> command = await node.Committed.ReadAsync(timeout.Token);
-        return Encoding.UTF8.GetString(command.ToArray());
+        internal NonBatchTransport(IRaftTransport inner) => _inner = inner;
+
+        public event Action<ReadOnlyMemory<byte>>? FrameReceived
+        {
+            add => _inner.FrameReceived += value;
+            remove => _inner.FrameReceived -= value;
+        }
+
+        public ValueTask StartAsync(CancellationToken cancellationToken = default) =>
+            _inner.StartAsync(cancellationToken);
+
+        public ValueTask SendAsync(
+            ulong recipient,
+            ReadOnlyMemory<byte> frame,
+            CancellationToken cancellationToken = default) =>
+            _inner.SendAsync(recipient, frame, cancellationToken);
+
+        public ValueTask DisposeAsync() => _inner.DisposeAsync();
     }
 }

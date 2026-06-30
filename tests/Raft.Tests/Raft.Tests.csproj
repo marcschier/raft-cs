@@ -29,7 +29,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Raft\Raft.csproj" />
     <ProjectReference Include="..\..\src\Raft.Transport\Raft.Transport.csproj" />
-    <ProjectReference Include="..\..\src\Raft.Storage.File\Raft.Storage.File.csproj" />
   </ItemGroup>
 
 </Project>

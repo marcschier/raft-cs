@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Raft.Storage.File\Raft.Storage.File.csproj" />
+    <ProjectReference Include="..\..\src\Raft.Transport\Raft.Transport.csproj" />
   </ItemGroup>
 
 </Project>
