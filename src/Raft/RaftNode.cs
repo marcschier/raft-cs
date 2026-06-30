@@ -43,6 +43,7 @@ public sealed class RaftNode : IAsyncDisposable
     private long _leaderId;
     private long _term;
     private long _commitIndex;
+    private long _appliedIndex;
 
     /// <summary>Initializes a new instance of the <see cref="RaftNode"/> class.</summary>
     /// <param name="config">The Raft configuration.</param>
@@ -67,6 +68,7 @@ public sealed class RaftNode : IAsyncDisposable
         _options = options ?? new RaftNodeOptions();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _core = new RaftCore(config, storage);
+        _appliedIndex = (long)_core.Applied;
         _confState = storage.InitialState().ConfState;
         _inbox = Channel.CreateUnbounded<object>(new UnboundedChannelOptions
         {
@@ -111,6 +113,9 @@ public sealed class RaftNode : IAsyncDisposable
 
     /// <summary>Gets this node's highest committed index.</summary>
     public ulong CommitIndex => (ulong)Interlocked.Read(ref _commitIndex);
+
+    /// <summary>Gets the highest log index applied to the state machine and surfaced through <see cref="Committed"/>.</summary>
+    public ulong AppliedIndex => (ulong)Interlocked.Read(ref _appliedIndex);
 
     /// <summary>Gets the current role.</summary>
     public RaftRole Role => (RaftRole)(byte)_packedState;
@@ -223,6 +228,49 @@ public sealed class RaftNode : IAsyncDisposable
         return _inbox.Writer.WriteAsync(message, cancellationToken);
     }
 
+    /// <summary>
+    /// Discards the applied log prefix up to (and excluding) <paramref name="index"/> to bound the on-disk log. The
+    /// compaction runs on the driver loop, serialized with all other storage access. A follower whose next index falls
+    /// below the compacted boundary is automatically re-seeded with a snapshot, so for full state transfer to a
+    /// far-behind follower the <see cref="IRaftWritableStorage"/> must serialize/restore application state in its
+    /// <see cref="IRaftStorage.Snapshot"/>/<see cref="IRaftWritableStorage.ApplySnapshot"/> implementations (the
+    /// built-in stores carry no application state in snapshots).
+    /// </summary>
+    /// <param name="index">The first index to retain; must not exceed <see cref="AppliedIndex"/>.</param>
+    /// <param name="cancellationToken">A token that cancels the wait (the compaction itself still completes).</param>
+    /// <returns>A task that completes when the log has been compacted.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> exceeds <see cref="AppliedIndex"/>.</exception>
+    public Task CompactAsync(ulong index, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ulong applied = AppliedIndex;
+        if (index > applied)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(index), index, $"Cannot compact past the applied index {applied}.");
+        }
+
+        var request = new CompactRequest(index);
+        if (cancellationToken.CanBeCanceled)
+        {
+            CancellationTokenRegistration registration = cancellationToken.Register(
+                static state => ((CompactRequest)state!).Completion.TrySetCanceled(), request);
+            _ = request.Completion.Task.ContinueWith(
+                static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
+                registration,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        if (!_inbox.Writer.TryWrite(request))
+        {
+            request.Completion.TrySetException(new ObjectDisposedException(nameof(RaftNode)));
+        }
+
+        return request.Completion.Task;
+    }
+
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
@@ -300,6 +348,10 @@ public sealed class RaftNode : IAsyncDisposable
                     else if (item is AppendComplete complete)
                     {
                         await OnAppendCompleteAsync(complete, cancellationToken).ConfigureAwait(false);
+                    }
+                    else if (item is CompactRequest compact)
+                    {
+                        HandleCompact(compact);
                     }
                 }
 
@@ -407,6 +459,25 @@ public sealed class RaftNode : IAsyncDisposable
                     new Entry(EntryType.ConfChangeV2, 0, 0, ConfChangeV2.LeaveJoint().Encode()),
                 },
             });
+        }
+    }
+
+    private void HandleCompact(CompactRequest request)
+    {
+        try
+        {
+            // No-op when the prefix is already compacted; otherwise discard the applied prefix on the loop thread,
+            // serialized with every other storage access.
+            if (request.Index >= _storage.FirstIndex())
+            {
+                _storage.Compact(request.Index);
+            }
+
+            request.Completion.TrySetResult(true);
+        }
+        catch (Exception ex)
+        {
+            request.Completion.TrySetException(ex);
         }
     }
 
@@ -520,6 +591,7 @@ public sealed class RaftNode : IAsyncDisposable
         Interlocked.Exchange(ref _leaderId, (long)leaderId);
         Interlocked.Exchange(ref _term, (long)term);
         Interlocked.Exchange(ref _commitIndex, (long)_core.CommitIndex);
+        Interlocked.Exchange(ref _appliedIndex, (long)_core.Applied);
         _packedState = (byte)role;
 
         // Publish a leadership/role transition only when the recognized leader or the role actually changes; the term
@@ -552,5 +624,19 @@ public sealed class RaftNode : IAsyncDisposable
         internal AppendComplete(StorageWrite write) => Write = write;
 
         internal StorageWrite Write { get; }
+    }
+
+    /// <summary>Loop request to compact the log up to (and excluding) <see cref="Index"/>.</summary>
+    private sealed class CompactRequest
+    {
+        internal CompactRequest(ulong index)
+        {
+            Index = index;
+            Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        internal ulong Index { get; }
+
+        internal TaskCompletionSource<bool> Completion { get; }
     }
 }

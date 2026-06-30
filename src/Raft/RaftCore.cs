@@ -114,6 +114,9 @@ public sealed partial class RaftCore
 
     internal ulong UncommittedSize => _uncommittedSize;
 
+    /// <summary>Gets the highest log index applied to the state machine.</summary>
+    public ulong Applied => _log.Applied;
+
     /// <summary>Gets the highest committed log index.</summary>
     public ulong CommitIndex => _log.Committed;
 
