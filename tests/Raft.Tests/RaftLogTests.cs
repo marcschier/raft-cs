@@ -10,17 +10,22 @@ public sealed class RaftLogTests
     [Test]
     public async Task AppendAndCommit_TracksWatermarks()
     {
-        var log = new RaftLog(new MemoryStorage());
-        log.Append(new[]
+        var storage = new MemoryStorage();
+        var log = new RaftLog(storage);
+        Entry[] entries =
         {
             new Entry(EntryType.Normal, 1, 1, default),
             new Entry(EntryType.Normal, 1, 2, default),
-        });
+        };
+        log.Append(entries);
 
         await Assert.That(log.LastIndex()).IsEqualTo((ulong)2);
         await Assert.That(log.LastTerm()).IsEqualTo((ulong)1);
         await Assert.That(log.Term(2)).IsEqualTo((ulong)1);
 
+        // Entries must be durable (persisted to storage and marked stable) before they may be applied.
+        storage.Append(entries);
+        log.StableEntriesTo(2, 1);
         log.CommitTo(2);
         await Assert.That(log.Committed).IsEqualTo((ulong)2);
 

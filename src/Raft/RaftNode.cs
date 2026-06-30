@@ -17,6 +17,7 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly RaftCore _core;
     private readonly IRaftWritableStorage _storage;
     private readonly Raft.Transport.IRaftTransport _transport;
+    private readonly Raft.Transport.IRaftBatchTransport? _batchTransport;
     private readonly RaftNodeOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly Channel<object> _inbox;
@@ -27,9 +28,11 @@ public sealed class RaftNode : IAsyncDisposable
 
     private ConfState _confState;
     private Task? _loop;
+    private Task? _appendTask;
     private ITimer? _tickTimer;
     private bool _started;
     private bool _disposed;
+    private bool _appendInFlight;
     private volatile uint _packedState;
     private long _leaderId;
     private long _term;
@@ -54,6 +57,7 @@ public sealed class RaftNode : IAsyncDisposable
 
         _storage = storage;
         _transport = transport;
+        _batchTransport = transport as Raft.Transport.IRaftBatchTransport;
         _options = options ?? new RaftNodeOptions();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _core = new RaftCore(config, storage);
@@ -202,6 +206,18 @@ public sealed class RaftNode : IAsyncDisposable
             }
         }
 
+        // Await any in-flight storage write so the worker has released the store before the caller disposes it.
+        if (_appendTask is not null)
+        {
+            try
+            {
+                await _appendTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
         _transport.FrameReceived -= OnFrameReceived;
         await _transport.DisposeAsync().ConfigureAwait(false);
         _committed.Writer.TryComplete();
@@ -235,6 +251,10 @@ public sealed class RaftNode : IAsyncDisposable
                     {
                         _core.Step(message);
                     }
+                    else if (item is AppendComplete complete)
+                    {
+                        await OnAppendCompleteAsync(complete, cancellationToken).ConfigureAwait(false);
+                    }
                 }
 
                 await ProcessReadyAsync(cancellationToken).ConfigureAwait(false);
@@ -247,57 +267,101 @@ public sealed class RaftNode : IAsyncDisposable
 
     private async Task ProcessReadyAsync(CancellationToken cancellationToken)
     {
-        Snapshot? snapshot = _core.UnstableSnapshot();
-        if (snapshot is not null && !snapshot.IsEmpty)
+        // 1. Send the immediately sendable messages (a leader's appends/heartbeats, vote requests, snapshots) before
+        //    persisting below, so replication to followers overlaps the local disk write ("writing to the leader's
+        //    disk in parallel").
+        IReadOnlyList<Message> sendNow = _core.TakeSendNowMessages();
+        if (sendNow.Count > 0)
         {
-            _storage.ApplySnapshot(snapshot);
-            _confState = snapshot.Metadata.ConfState;
-            _core.StableSnapshotTo(snapshot.Metadata.Index);
+            await SendBatchAsync(sendNow, cancellationToken).ConfigureAwait(false);
         }
 
-        IReadOnlyList<Entry> unstable = _core.UnstableEntries();
-        if (unstable.Count > 0)
+        // 2. Hand the next durable write to a background worker. At most one write is outstanding at a time, so entries
+        //    appended while a write is in flight are batched into the following write.
+        if (!_appendInFlight)
         {
-            _storage.Append(unstable);
-            Entry last = unstable[unstable.Count - 1];
-            _core.StableTo(last.Index, last.Term);
-        }
-
-        _storage.SetHardState(_core.HardState);
-
-        IReadOnlyList<Message> messages = _core.TakeMessages();
-        for (int i = 0; i < messages.Count; i++)
-        {
-            await SendAsync(messages[i], cancellationToken).ConfigureAwait(false);
-        }
-
-        IReadOnlyList<Entry> toApply = _core.NextEntriesToApply();
-        if (toApply.Count > 0)
-        {
-            ulong appliedTo = 0;
-            foreach (Entry entry in toApply)
+            StorageWrite? write = _core.TakeStorageWrite();
+            if (write is not null)
             {
-                ApplyEntry(entry);
-                appliedTo = entry.Index;
-            }
-
-            _core.AppliedTo(appliedTo);
-
-            if (_core.ShouldAutoLeaveJoint())
-            {
-                _inbox.Writer.TryWrite(new Message
+                if (write.Snapshot is not null)
                 {
-                    From = _core.Id,
-                    Type = MessageType.Propose,
-                    Entries = new[]
-                    {
-                        new Entry(EntryType.ConfChangeV2, 0, 0, ConfChangeV2.LeaveJoint().Encode()),
-                    },
-                });
+                    _confState = write.Snapshot.Metadata.ConfState;
+                }
+
+                _appendInFlight = true;
+                _appendTask = Task.Run(() => RunStorageWrite(write), CancellationToken.None);
             }
         }
 
+        // 3. Apply committed-and-durable entries to the state machine (conf changes on the loop for ordering).
+        ApplyCommitted();
+
+        // 4. Publish observable state.
         PublishState();
+    }
+
+    private async Task OnAppendCompleteAsync(AppendComplete complete, CancellationToken cancellationToken)
+    {
+        _appendInFlight = false;
+        StorageWrite write = complete.Write;
+
+        // Responses (follower append acknowledgements and granted votes) are released only now that the write is
+        // durable, because a node must never acknowledge state it has not yet persisted.
+        if (write.Responses.Count > 0)
+        {
+            await SendBatchAsync(write.Responses, cancellationToken).ConfigureAwait(false);
+        }
+
+        _core.AckStorageWrite(write);
+    }
+
+    private void RunStorageWrite(StorageWrite write)
+    {
+        try
+        {
+            _storage.Write(write.Entries, write.HardState, write.Snapshot);
+        }
+        catch (Exception ex)
+        {
+            // A storage write failure is unrecoverable for consensus: surface it to the committed-command consumer and
+            // stop the driver loop.
+            _committed.Writer.TryComplete(ex);
+            _stop.Cancel();
+            return;
+        }
+
+        _inbox.Writer.TryWrite(new AppendComplete(write));
+    }
+
+    private void ApplyCommitted()
+    {
+        IReadOnlyList<Entry> toApply = _core.NextEntriesToApply();
+        if (toApply.Count == 0)
+        {
+            return;
+        }
+
+        ulong appliedTo = 0;
+        foreach (Entry entry in toApply)
+        {
+            ApplyEntry(entry);
+            appliedTo = entry.Index;
+        }
+
+        _core.AppliedTo(appliedTo);
+
+        if (_core.ShouldAutoLeaveJoint())
+        {
+            _inbox.Writer.TryWrite(new Message
+            {
+                From = _core.Id,
+                Type = MessageType.Propose,
+                Entries = new[]
+                {
+                    new Entry(EntryType.ConfChangeV2, 0, 0, ConfChangeV2.LeaveJoint().Encode()),
+                },
+            });
+        }
     }
 
     private void ApplyEntry(Entry entry)
@@ -323,27 +387,78 @@ public sealed class RaftNode : IAsyncDisposable
         }
     }
 
-    private async ValueTask SendAsync(Message message, CancellationToken cancellationToken)
+    private async ValueTask SendBatchAsync(IReadOnlyList<Message> messages, CancellationToken cancellationToken)
     {
-        if (message.To == 0 || message.To == _core.Id)
+        if (messages.Count == 0)
         {
             return;
         }
 
-        int length = MessageCodec.EncodedLength(message);
-        byte[] frame = new byte[length];
-        if (!MessageCodec.TryWrite(message, frame))
+        if (_batchTransport is not null)
+        {
+            List<Raft.Transport.OutboundFrame>? frames = null;
+            for (int i = 0; i < messages.Count; i++)
+            {
+                if (TryEncodeFrame(messages[i], out Raft.Transport.OutboundFrame frame))
+                {
+                    frames ??= new List<Raft.Transport.OutboundFrame>(messages.Count);
+                    frames.Add(frame);
+                }
+            }
+
+            if (frames is not null)
+            {
+                try
+                {
+                    await _batchTransport.SendManyAsync(frames, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+
+            return;
+        }
+
+        for (int i = 0; i < messages.Count; i++)
+        {
+            await SendAsync(messages[i], cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask SendAsync(Message message, CancellationToken cancellationToken)
+    {
+        if (!TryEncodeFrame(message, out Raft.Transport.OutboundFrame frame))
         {
             return;
         }
 
         try
         {
-            await _transport.SendAsync(message.To, frame, cancellationToken).ConfigureAwait(false);
+            await _transport.SendAsync(frame.Recipient, frame.Frame, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
         }
+    }
+
+    private bool TryEncodeFrame(Message message, out Raft.Transport.OutboundFrame frame)
+    {
+        frame = default;
+        if (message.To == 0 || message.To == _core.Id)
+        {
+            return false;
+        }
+
+        int length = MessageCodec.EncodedLength(message);
+        byte[] bytes = new byte[length];
+        if (!MessageCodec.TryWrite(message, bytes))
+        {
+            return false;
+        }
+
+        frame = new Raft.Transport.OutboundFrame(message.To, bytes);
+        return true;
     }
 
     private void PublishState()
@@ -364,5 +479,13 @@ public sealed class RaftNode : IAsyncDisposable
             throw new ObjectDisposedException(nameof(RaftNode));
         }
 #endif
+    }
+
+    /// <summary>Loop signal posted by the storage worker when a <see cref="StorageWrite"/> has been made durable.</summary>
+    private sealed class AppendComplete
+    {
+        internal AppendComplete(StorageWrite write) => Write = write;
+
+        internal StorageWrite Write { get; }
     }
 }
