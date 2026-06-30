@@ -74,4 +74,22 @@ public sealed class QuorumTests
         var partial = new Dictionary<ulong, bool> { [1] = true, [2] = true };
         await Assert.That(joint.TallyVotes(partial)).IsEqualTo(VoteResult.Pending);
     }
+
+    [Test]
+    public async Task JointConfig_TallyVotes_OneSideLost_IsLost()
+    {
+        var joint = new JointConfig(
+            new MajorityConfig(new ulong[] { 1, 2, 3 }),
+            new MajorityConfig(new ulong[] { 3, 4, 5 }));
+
+        // Incoming grants a quorum (Won) but outgoing rejects a quorum (Lost); the joint result is Lost.
+        var votes = new Dictionary<ulong, bool>
+        {
+            [1] = true,
+            [2] = true,
+            [4] = false,
+            [5] = false,
+        };
+        await Assert.That(joint.TallyVotes(votes)).IsEqualTo(VoteResult.Lost);
+    }
 }

@@ -54,6 +54,48 @@ public sealed class ConfChangeTests
         await Assert.That(Sorted(left.Voters)).IsEqualTo("1,2");
     }
 
+    [Test]
+    public async Task Decode_ShortBuffer_ReturnsEmptyChange()
+    {
+        ConfChangeV2 decoded = ConfChangeV2.Decode(new byte[] { 1 });
+        await Assert.That(decoded.Changes.Count).IsEqualTo(0);
+        await Assert.That(decoded.UseJoint).IsFalse();
+    }
+
+    [Test]
+    public async Task Changer_AddLearnerNode_DemotesVoterToLearner()
+    {
+        var current = new ConfState(new ulong[] { 1, 2, 3 });
+        ConfState next = Changer.Apply(current, ConfChangeV2.Single(ConfChangeType.AddLearnerNode, 3));
+
+        await Assert.That(Sorted(next.Voters)).IsEqualTo("1,2");
+        await Assert.That(Sorted(next.Learners)).IsEqualTo("3");
+        await Assert.That(next.IsJoint).IsFalse();
+    }
+
+    [Test]
+    public async Task Changer_EnterJoint_DemoteVoter_StagesInLearnersNext()
+    {
+        var current = new ConfState(new ulong[] { 1, 2, 3 });
+        ConfState joint = Changer.Apply(
+            current,
+            new ConfChangeV2(new[] { new ConfChangeSingle(ConfChangeType.AddLearnerNode, 3) }, useJoint: true));
+
+        // The demoted node is still a voter in the outgoing config, so it is staged in LearnersNext.
+        await Assert.That(joint.IsJoint).IsTrue();
+        await Assert.That(Sorted(joint.Voters)).IsEqualTo("1,2");
+        await Assert.That(Sorted(joint.VotersOutgoing)).IsEqualTo("1,2,3");
+        await Assert.That(Sorted(joint.LearnersNext)).IsEqualTo("3");
+    }
+
+    [Test]
+    public async Task Changer_InvalidChangeType_Throws()
+    {
+        var current = new ConfState(new ulong[] { 1, 2 });
+        await Assert.That(() => Changer.Apply(current, ConfChangeV2.Single((ConfChangeType)99, 5)))
+            .Throws<ArgumentOutOfRangeException>();
+    }
+
     private static string Sorted(IReadOnlyList<ulong> ids)
     {
         var copy = new List<ulong>(ids);
