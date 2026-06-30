@@ -32,6 +32,8 @@ dotnet add package RaftCs.Transport.NanoMsg    # NNG/nanomsg (BUS) transport
 dotnet add package RaftCs.Storage.File         # crash-safe file (WAL) IRaftStorage
 ```
 
+All packages are **strong-named** — every assembly is signed with one shared key, public-key token `dfdc46ace5e226f1` — so they can be referenced from strong-named (signed) assemblies. Strong naming here is an identity mechanism only, not a security guarantee.
+
 ## 🚀 Quick start
 
 ```csharp

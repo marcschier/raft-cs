@@ -1,7 +1,5 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
-using System.Runtime.CompilerServices;
-
-[assembly: InternalsVisibleTo("Raft.Tests")]
-[assembly: InternalsVisibleTo("Raft.Interop.Tests")]
-[assembly: InternalsVisibleTo("Raft.Benchmarks")]
+// The public API uses unsigned integer types (ulong node ids, terms, indices), which are not
+// CLS-compliant, so the assembly is explicitly marked non-compliant.
+[assembly: CLSCompliant(false)]

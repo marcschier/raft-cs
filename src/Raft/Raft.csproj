@@ -10,6 +10,26 @@
     <PackageTags>raft;consensus;distributed-systems;replication;state-machine;leader-election;aot;span;high-performance</PackageTags>
   </PropertyGroup>
 
+  <!-- Friend (InternalsVisibleTo) grants. The strong-name public key of eng/Raft.snk is built up
+       across short lines so the long key isn't subject to the C# line-length gate; the SDK appends
+       $(PublicKey) to each InternalsVisibleTo item below. -->
+  <PropertyGroup>
+    <PublicKey>0024000004800000940000000602000000240000</PublicKey>
+    <PublicKey>$(PublicKey)525341310004000001000100D91B3CFE7660AF8F</PublicKey>
+    <PublicKey>$(PublicKey)AC1FE7BBA086FBBB9C586381AFCEB46570711975</PublicKey>
+    <PublicKey>$(PublicKey)CF2B50225A110A2CBF5F3F989C9148BCCB743F01</PublicKey>
+    <PublicKey>$(PublicKey)C2A2D99B99496DC7C4C0BE44ED7D542E1B709CCF</PublicKey>
+    <PublicKey>$(PublicKey)B15479484AE0187F0CFD7958F34AB2D39E663673</PublicKey>
+    <PublicKey>$(PublicKey)838C49347A76B6BC50CC63A15992200427A730BF</PublicKey>
+    <PublicKey>$(PublicKey)1C583048153DF84E5FC7461C6DC6F4AF3B759CD3</PublicKey>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Raft.Tests" />
+    <InternalsVisibleTo Include="Raft.Interop.Tests" />
+    <InternalsVisibleTo Include="Raft.Benchmarks" />
+  </ItemGroup>
+
   <!-- Core async surface (RaftNode) needs Channels/async interfaces on netstandard. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' OR '$(TargetFramework)' == 'netstandard2.1'">
     <PackageReference Include="System.Threading.Channels" />
