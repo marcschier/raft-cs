@@ -1,4 +1,4 @@
-# 🧭 Raft
+# 🧭 raft-cs
 
 [![CI](https://github.com/marcschier/raft-cs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/marcschier/raft-cs/actions/workflows/ci.yml) [![NuGet](https://img.shields.io/nuget/v/RaftCs?logo=nuget&label=NuGet)](https://www.nuget.org/packages/RaftCs) [![GitHub Packages](https://img.shields.io/badge/GitHub%20Packages-RaftCs-2088FF?logo=github&logoColor=white)](https://github.com/marcschier/raft-cs/pkgs/nuget/RaftCs)
 
@@ -74,12 +74,9 @@ dotnet test Raft.slnx -c Release
 - [Wire format](docs/wire-format.md)
 - [API reference](docs/api.md)
 
-## 🧪 Samples
+## 🧪 Samples & Interop
 
 - [In-memory cluster](samples/Raft.Samples) — three nodes elect a leader and replicate commands over the in-memory transport; runs anywhere.
-
-## 🔬 Interop
-
 - [raft-rs behavioral parity](interop/README.md) — a Rust harness wrapping tikv/raft-rs produces golden traces that the .NET implementation must reproduce.
 
 ## 📄 License
