@@ -28,13 +28,10 @@ public sealed partial class RaftCore
             return false;
         }
 
-        ulong newLast = _log.Append(stamped);
-        Raft.Progress.Progress? self = _tracker.GetProgress(Id);
-        if (self is not null)
-        {
-            self.MaybeUpdate(newLast);
-        }
+        _log.Append(stamped);
 
+        // NOTE: the leader's own match index is advanced in StableTo, once these entries are durable, rather than here
+        // at append time. This gates the leader's commit contribution on its local disk write completing.
         MaybeCommit();
         return true;
     }
