@@ -169,3 +169,56 @@ public readonly struct SoftState : IEquatable<SoftState>
     /// <inheritdoc/>
     public override int GetHashCode() => HashCode.Combine(LeaderId, (byte)Role);
 }
+
+/// <summary>
+/// A notification that this node's observable leadership state changed: a new <see cref="Role"/> and/or the
+/// <see cref="LeaderId"/> it recognizes, captured at the term in which the change was observed. Carries the term so it
+/// stays meaningful when delivered asynchronously over <see cref="RaftNode.StateChanges"/>.
+/// </summary>
+public readonly struct RaftStateChange : IEquatable<RaftStateChange>
+{
+    /// <summary>Initializes a new instance of the <see cref="RaftStateChange"/> struct.</summary>
+    /// <param name="term">The term in which the change was observed.</param>
+    /// <param name="leaderId">The id of the leader this node recognizes, or zero when unknown.</param>
+    /// <param name="role">The new role.</param>
+    public RaftStateChange(ulong term, ulong leaderId, RaftRole role)
+    {
+        Term = term;
+        LeaderId = leaderId;
+        Role = role;
+    }
+
+    /// <summary>Gets the term in which the change was observed.</summary>
+    public ulong Term { get; }
+
+    /// <summary>Gets the id of the leader this node recognizes, or zero when unknown.</summary>
+    public ulong LeaderId { get; }
+
+    /// <summary>Gets the new role.</summary>
+    public RaftRole Role { get; }
+
+    /// <summary>Gets a value indicating whether this node is now the leader.</summary>
+    public bool IsLeader => Role == RaftRole.Leader;
+
+    /// <summary>Compares two state changes for equality.</summary>
+    /// <param name="left">The left state change.</param>
+    /// <param name="right">The right state change.</param>
+    /// <returns><see langword="true"/> when the state changes are equal.</returns>
+    public static bool operator ==(RaftStateChange left, RaftStateChange right) => left.Equals(right);
+
+    /// <summary>Compares two state changes for inequality.</summary>
+    /// <param name="left">The left state change.</param>
+    /// <param name="right">The right state change.</param>
+    /// <returns><see langword="true"/> when the state changes differ.</returns>
+    public static bool operator !=(RaftStateChange left, RaftStateChange right) => !left.Equals(right);
+
+    /// <inheritdoc/>
+    public bool Equals(RaftStateChange other) =>
+        Term == other.Term && LeaderId == other.LeaderId && Role == other.Role;
+
+    /// <inheritdoc/>
+    public override bool Equals(object? obj) => obj is RaftStateChange other && Equals(other);
+
+    /// <inheritdoc/>
+    public override int GetHashCode() => HashCode.Combine(Term, LeaderId, (byte)Role);
+}

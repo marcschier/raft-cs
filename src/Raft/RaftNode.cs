@@ -22,17 +22,23 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly TimeProvider _timeProvider;
     private readonly Channel<object> _inbox;
     private readonly Channel<ReadOnlyMemory<byte>> _committed;
+    private readonly Channel<RaftStateChange> _stateChanges;
+    private readonly Channel<ConfState> _confChanges;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _startGate = new(1, 1);
     private readonly object _tickSignal = new();
 
     private ConfState _confState;
+    private volatile ConfState _publishedConfState;
     private Task? _loop;
     private Task? _appendTask;
     private ITimer? _tickTimer;
     private bool _started;
     private bool _disposed;
     private bool _appendInFlight;
+    private bool _stateEverPublished;
+    private ulong _lastEmittedLeaderId;
+    private RaftRole _lastEmittedRole;
     private volatile uint _packedState;
     private long _leaderId;
     private long _term;
@@ -72,6 +78,26 @@ public sealed class RaftNode : IAsyncDisposable
             SingleReader = false,
             SingleWriter = true,
         });
+
+        int capacity = _options.StateObservationCapacity;
+        if (capacity <= 0)
+        {
+            throw new ArgumentException("StateObservationCapacity must be positive.", nameof(options));
+        }
+
+        var observationOptions = new BoundedChannelOptions(capacity)
+        {
+            SingleReader = false,
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.DropOldest,
+        };
+        _stateChanges = Channel.CreateBounded<RaftStateChange>(observationOptions);
+        _confChanges = Channel.CreateBounded<ConfState>(observationOptions);
+
+        // Seed the committed-configuration stream and poll property with the recovered baseline membership so a
+        // stream-only consumer observes the starting configuration before any change.
+        _publishedConfState = _confState;
+        _confChanges.Writer.TryWrite(_confState);
     }
 
     /// <summary>Gets this node's id.</summary>
@@ -94,6 +120,24 @@ public sealed class RaftNode : IAsyncDisposable
 
     /// <summary>Gets a reader over committed application command payloads, in log order.</summary>
     public ChannelReader<ReadOnlyMemory<byte>> Committed => _committed.Reader;
+
+    /// <summary>
+    /// Gets a reader over leadership/role transitions. The current state is emitted as the first item; thereafter a
+    /// new <see cref="RaftStateChange"/> is published whenever the recognized leader id or the role changes. The
+    /// stream drops the oldest buffered item when a consumer falls behind (see
+    /// <see cref="RaftNodeOptions.StateObservationCapacity"/>), so the latest state is always retained.
+    /// </summary>
+    public ChannelReader<RaftStateChange> StateChanges => _stateChanges.Reader;
+
+    /// <summary>
+    /// Gets a reader over committed cluster configurations. The current configuration is emitted as the first item;
+    /// thereafter the new <see cref="ConfState"/> is published each time a membership change commits. Lets a consumer
+    /// reconcile membership against committed state rather than relying on the node's internal optimistic apply.
+    /// </summary>
+    public ChannelReader<ConfState> CommittedConfigurations => _confChanges.Reader;
+
+    /// <summary>Gets the most recently committed cluster configuration.</summary>
+    public ConfState Configuration => _publishedConfState;
 
     /// <summary>Starts the transport, the driver loop, and the tick timer.</summary>
     /// <param name="cancellationToken">A token that cancels startup.</param>
@@ -221,6 +265,8 @@ public sealed class RaftNode : IAsyncDisposable
         _transport.FrameReceived -= OnFrameReceived;
         await _transport.DisposeAsync().ConfigureAwait(false);
         _committed.Writer.TryComplete();
+        _stateChanges.Writer.TryComplete();
+        _confChanges.Writer.TryComplete();
         _startGate.Dispose();
         _stop.Dispose();
     }
@@ -383,6 +429,10 @@ public sealed class RaftNode : IAsyncDisposable
                 _confState = next;
                 _core.ApplyConfChange(next);
                 _storage.SetConfState(next);
+
+                // Surface the committed membership so consumers can reconcile against it.
+                _publishedConfState = next;
+                _confChanges.Writer.TryWrite(next);
                 break;
         }
     }
@@ -463,10 +513,25 @@ public sealed class RaftNode : IAsyncDisposable
 
     private void PublishState()
     {
-        Interlocked.Exchange(ref _leaderId, (long)_core.LeaderId);
-        Interlocked.Exchange(ref _term, (long)_core.Term);
+        ulong leaderId = _core.LeaderId;
+        ulong term = _core.Term;
+        RaftRole role = _core.Role;
+
+        Interlocked.Exchange(ref _leaderId, (long)leaderId);
+        Interlocked.Exchange(ref _term, (long)term);
         Interlocked.Exchange(ref _commitIndex, (long)_core.CommitIndex);
-        _packedState = (byte)_core.Role;
+        _packedState = (byte)role;
+
+        // Publish a leadership/role transition only when the recognized leader or the role actually changes; the term
+        // travels in the payload as context but does not by itself trigger an event. The first publish always emits,
+        // giving stream-only consumers a baseline. DropOldest means TryWrite never blocks the consensus loop.
+        if (!_stateEverPublished || leaderId != _lastEmittedLeaderId || role != _lastEmittedRole)
+        {
+            _stateEverPublished = true;
+            _lastEmittedLeaderId = leaderId;
+            _lastEmittedRole = role;
+            _stateChanges.Writer.TryWrite(new RaftStateChange(term, leaderId, role));
+        }
     }
 
     private void ThrowIfDisposed()

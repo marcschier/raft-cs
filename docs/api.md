@@ -13,6 +13,9 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | `ValueTask TransferLeadershipAsync(ulong targetId, CancellationToken)` | Requests leadership transfer (leader only). |
 | `ValueTask CampaignAsync(CancellationToken)` | Forces an immediate election campaign. |
 | `ChannelReader<ReadOnlyMemory<byte>> Committed` | Committed application commands, in log order. |
+| `ChannelReader<RaftStateChange> StateChanges` | Leadership/role transitions (baseline first, then on leader-id/role change). |
+| `ChannelReader<ConfState> CommittedConfigurations` | Committed cluster configurations (baseline first, then on each membership change). |
+| `ConfState Configuration` | The most recently committed cluster configuration. |
 | `ulong Id`, `ulong LeaderId`, `ulong Term`, `ulong CommitIndex`, `RaftRole Role`, `bool IsLeader` | Observable state. |
 
 ## RaftConfig
@@ -37,6 +40,7 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | --- | --- | --- |
 | `TickInterval` | `50 ms` | Wall-clock interval between logical ticks. |
 | `MaxApplyBytes` | `16 MiB` | Soft cap on committed bytes applied per cycle. |
+| `StateObservationCapacity` | `256` | Buffer for the `StateChanges`/`CommittedConfigurations` streams; oldest items drop when a consumer falls behind, so the latest value is always retained. |
 
 ## RaftCore
 
