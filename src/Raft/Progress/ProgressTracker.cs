@@ -13,12 +13,15 @@ public sealed class ProgressTracker
     private readonly Dictionary<ulong, Progress> _progress = new();
     private readonly Dictionary<ulong, bool> _votes = new();
     private readonly int _maxInflight;
+    private readonly ulong _maxInflightBytes;
 
     /// <summary>Initializes a new instance of the <see cref="ProgressTracker"/> class.</summary>
-    /// <param name="maxInflight">The per-peer flow-control window capacity.</param>
-    public ProgressTracker(int maxInflight)
+    /// <param name="maxInflight">The per-peer flow-control window capacity (message count).</param>
+    /// <param name="maxInflightBytes">The per-peer flow-control window capacity in payload bytes.</param>
+    public ProgressTracker(int maxInflight, ulong maxInflightBytes = ulong.MaxValue)
     {
         _maxInflight = maxInflight;
+        _maxInflightBytes = maxInflightBytes;
         Voters = new JointConfig();
         Learners = new HashSet<ulong>();
         LearnersNext = new HashSet<ulong>();
@@ -156,7 +159,7 @@ public sealed class ProgressTracker
         {
             if (!_progress.TryGetValue(id, out Progress? progress))
             {
-                progress = new Progress(nextIndex, _maxInflight);
+                progress = new Progress(nextIndex, _maxInflight, _maxInflightBytes);
                 _progress[id] = progress;
             }
 

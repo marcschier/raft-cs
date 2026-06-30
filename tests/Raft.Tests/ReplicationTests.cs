@@ -45,9 +45,11 @@ public sealed class ReplicationTests
     }
 
     [Test]
-    public async Task ProposalsOnNonLeaderAreNotCommitted()
+    public async Task ProposalsOnNonLeaderWithoutForwardingAreNotCommitted()
     {
-        var harness = new RaftHarness(new ulong[] { 1, 2, 3 });
+        var harness = new RaftHarness(
+            new ulong[] { 1, 2, 3 },
+            (_, config) => config.DisableProposalForwarding = true);
         harness.Campaign(1);
 
         harness.Propose(2, "ignored");

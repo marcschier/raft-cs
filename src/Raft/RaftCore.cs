@@ -21,8 +21,12 @@ public sealed partial class RaftCore
     private readonly RaftLog _log;
     private readonly ProgressTracker _tracker;
     private readonly List<Message> _msgs = new();
+    private readonly List<Message> _msgsAfterAppend = new();
     private readonly Random _rng;
     private readonly ulong _maxSizePerMessage;
+    private readonly ulong _maxUncommittedSize;
+    private readonly bool _disableProposalForwarding;
+    private ulong _uncommittedSize;
 
     private int _electionElapsed;
     private int _heartbeatElapsed;
@@ -44,9 +48,11 @@ public sealed partial class RaftCore
         PreVote = config.PreVote;
         CheckQuorum = config.CheckQuorum;
         _maxSizePerMessage = config.MaxSizePerMessage;
+        _maxUncommittedSize = config.MaxUncommittedEntriesSize;
+        _disableProposalForwarding = config.DisableProposalForwarding;
         _rng = new Random(unchecked((int)(config.Id * 2654435761u)));
         _log = new RaftLog(storage);
-        _tracker = new ProgressTracker(config.MaxInflightMessages);
+        _tracker = new ProgressTracker(config.MaxInflightMessages, config.MaxInflightBytes);
 
         (HardState hardState, ConfState confState) = storage.InitialState();
         _tracker.ApplyConf(confState, 1);
@@ -102,6 +108,8 @@ public sealed partial class RaftCore
     internal RaftLog Log => _log;
 
     internal ulong PendingConfIndex { get; private set; }
+
+    internal ulong UncommittedSize => _uncommittedSize;
 
     /// <summary>Gets the highest committed log index.</summary>
     public ulong CommitIndex => _log.Committed;
@@ -395,6 +403,7 @@ public sealed partial class RaftCore
         Reset(Term);
         LeaderId = Id;
         Role = RaftRole.Leader;
+        _uncommittedSize = 0;
 
         PendingConfIndex = _log.LastIndex();
         var noop = new Entry(EntryType.Normal, Term, _log.LastIndex() + 1, ReadOnlyMemory<byte>.Empty);
