@@ -69,6 +69,7 @@ dotnet test Raft.slnx -c Release
 ## 📚 Documentation
 
 - [Getting started](docs/getting-started.md)
+- [Adoption guide](docs/adoption.md) — state machine, bootstrapping, snapshots & compaction, transports, operations
 - [Architecture](docs/architecture.md)
 - [Wire format](docs/wire-format.md)
 - [API reference](docs/api.md)

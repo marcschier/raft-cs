@@ -12,11 +12,12 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | `ValueTask ChangeConfigurationAsync(ConfChangeV2, CancellationToken)` | Proposes a membership change. |
 | `ValueTask TransferLeadershipAsync(ulong targetId, CancellationToken)` | Requests leadership transfer (leader only). |
 | `ValueTask CampaignAsync(CancellationToken)` | Forces an immediate election campaign. |
+| `Task CompactAsync(ulong index, CancellationToken)` | Discards the applied log prefix before `index` (on the loop; thread-safe). |
 | `ChannelReader<ReadOnlyMemory<byte>> Committed` | Committed application commands, in log order. |
 | `ChannelReader<RaftStateChange> StateChanges` | Leadership/role transitions (baseline first, then on leader-id/role change). |
 | `ChannelReader<ConfState> CommittedConfigurations` | Committed cluster configurations (baseline first, then on each membership change). |
 | `ConfState Configuration` | The most recently committed cluster configuration. |
-| `ulong Id`, `ulong LeaderId`, `ulong Term`, `ulong CommitIndex`, `RaftRole Role`, `bool IsLeader` | Observable state. |
+| `ulong Id`, `ulong LeaderId`, `ulong Term`, `ulong CommitIndex`, `ulong AppliedIndex`, `RaftRole Role`, `bool IsLeader` | Observable state. |
 
 ## RaftConfig
 
