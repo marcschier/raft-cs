@@ -43,4 +43,13 @@ public sealed class RaftConfigTests
         RaftCore core = Build(config);
         await Assert.That(core.Id).IsEqualTo((ulong)1);
     }
+
+    [Test]
+    public async Task HeartbeatTick_NonPositive_Throws()
+    {
+        // ElectionTick keeps its default (10) so the ElectionTick<=HeartbeatTick guard passes and the
+        // HeartbeatTick<=0 guard is the one exercised.
+        var config = new RaftConfig { Id = 1, HeartbeatTick = 0 };
+        await Assert.That(() => Build(config)).Throws<ArgumentException>();
+    }
 }

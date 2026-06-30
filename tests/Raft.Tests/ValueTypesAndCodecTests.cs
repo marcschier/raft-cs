@@ -69,4 +69,17 @@ public sealed class ValueTypesAndCodecTests
         await Assert.That(string.Join(",", decodedBytes)).IsEqualTo("9,8,7,6");
         await Assert.That(partialRejected).IsTrue();
     }
+
+    [Test]
+    public async Task ConfState_Equals_NullAndDifferentType()
+    {
+        var a = new ConfState(new ulong[] { 1, 2 }, new ulong[] { 3 });
+        var equal = new ConfState(new ulong[] { 1, 2 }, new ulong[] { 3 });
+        ConfState? nothing = null;
+
+        await Assert.That(a.Equals(nothing)).IsFalse();
+        object boxed = a;
+        await Assert.That(boxed.Equals(equal)).IsTrue();
+        await Assert.That(boxed.Equals(null)).IsFalse();
+    }
 }

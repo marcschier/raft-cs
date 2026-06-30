@@ -110,4 +110,80 @@ public sealed class RaftLogTests
         await Assert.That(log.LastIndex()).IsEqualTo((ulong)8);
         await Assert.That(log.UnstableSnapshot).IsNotNull();
     }
+
+    [Test]
+    public async Task TryMaybeAppend_ConflictWithCommitted_Throws()
+    {
+        var log = new RaftLog(new MemoryStorage());
+        log.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.Normal, 1, 2, default),
+        });
+        log.CommitTo(2);
+
+        // An entry at index 1 (term 2) conflicts with the already-committed entry there, which is illegal.
+        Entry[] conflicting = { new Entry(EntryType.Normal, 2, 1, default) };
+        await Assert.That(() => log.TryMaybeAppend(0, 0, 2, conflicting, out _))
+            .Throws<InvalidOperationException>();
+    }
+
+    [Test]
+    public async Task CommitTo_BeyondLastIndex_Throws()
+    {
+        var log = new RaftLog(new MemoryStorage());
+        log.Append(new[] { new Entry(EntryType.Normal, 1, 1, default) });
+        await Assert.That(() => log.CommitTo(5)).Throws<InvalidOperationException>();
+    }
+
+    [Test]
+    public async Task AppliedTo_Zero_IsNoOp_AndBeyondCommittedThrows()
+    {
+        var log = new RaftLog(new MemoryStorage());
+        log.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.Normal, 1, 2, default),
+        });
+
+        log.AppliedTo(0);
+        await Assert.That(log.Applied).IsEqualTo((ulong)0);
+
+        // Applying past the committed watermark is out of range.
+        await Assert.That(() => log.AppliedTo(2)).Throws<InvalidOperationException>();
+    }
+
+    [Test]
+    public async Task TryRestore_OlderThanCommitted_ReturnsFalse()
+    {
+        var log = new RaftLog(new MemoryStorage());
+        log.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.Normal, 1, 2, default),
+            new Entry(EntryType.Normal, 1, 3, default),
+        });
+        log.CommitTo(3);
+
+        var stale = new Snapshot(new SnapshotMetadata(2, 1, new ConfState(new ulong[] { 1 })), default);
+        await Assert.That(log.TryRestore(stale)).IsFalse();
+        await Assert.That(log.Committed).IsEqualTo((ulong)3);
+    }
+
+    [Test]
+    public async Task TryRestore_MatchingTerm_FastForwardsCommitWithoutRestoring()
+    {
+        var log = new RaftLog(new MemoryStorage());
+        log.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.Normal, 2, 2, default),
+            new Entry(EntryType.Normal, 2, 3, default),
+        });
+
+        // The snapshot point matches the local log term, so the commit fast-forwards without an unstable restore.
+        var snapshot = new Snapshot(new SnapshotMetadata(2, 2, new ConfState(new ulong[] { 1 })), default);
+        await Assert.That(log.TryRestore(snapshot)).IsFalse();
+        await Assert.That(log.Committed).IsEqualTo((ulong)2);
+    }
 }
