@@ -9,6 +9,8 @@ A pure-managed, **NativeAOT-ready** implementation of the **[Raft consensus algo
 ## ✨ Why Raft
 
 - **Complete consensus**: leader election with **pre-vote**, log replication and commit, **snapshots** with log compaction, **joint-consensus** membership changes with learners, and **leadership transfer**.
+- **Low-latency replication**: **optimistic pipelining**, per-peer **flow control** (message- and byte-windowed), **batched** network sends, and **asynchronous storage writes** that let the leader replicate to followers in parallel with persisting to its own disk.
+- **Robust under failure**: optional **check-quorum** step-down when a leader loses contact with a majority, an **uncommitted-log byte cap** that protects against unbounded log growth when quorum is lost, and internal **proposal forwarding** from followers to the leader.
 - **Replaceable everything**: the `IRaftStorage` and `IRaftTransport` abstractions ship with an in-memory + file (WAL) store and an in-memory + NanoMsg (NNG/nanomsg) transport.
 - **Fast**: `readonly struct`/`readonly ref struct` building blocks, `Span<byte>`/`BinaryPrimitives`/`stackalloc` codecs, `ArrayPool` framing, an `Inflights` ring buffer, and no LINQ on hot paths.
 - **NativeAOT & trimming clean** on .NET 8/9/10 — the library is annotated `IsAotCompatible`, and the test suite itself runs as a NativeAOT binary.

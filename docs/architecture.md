@@ -40,14 +40,25 @@ Configuration is a `JointConfig` of an incoming and outgoing `MajorityConfig`; a
 
 ## RaftNode — the async driver
 
-`RaftNode` is the public, thread-safe facade. A single loop consumes ticks, inbound frames, and proposals from one channel, advances the core, then runs a ready cycle: persist the unstable snapshot/entries and hard state, send outbound messages over the transport (encoded with `MessageCodec`), apply committed entries to the `Committed` channel (applying conf-change entries via `Changer`), and advance the stable/applied watermarks.
+`RaftNode` is the public, thread-safe facade. A single loop consumes ticks, inbound frames, proposals, and storage-completion signals from one channel and advances the deterministic core, so all core state stays single-threaded while I/O happens off the loop.
+
+Each ready cycle uses the **asynchronous storage-writes** model (mirroring etcd's `AsyncStorageWrites`), which is what lets the leader write to its own disk in parallel with replicating to followers:
+
+1. **Send first.** Immediately sendable messages (a leader's `Append`/`Heartbeat`, vote requests, snapshots) are drained with `TakeSendNowMessages()` and dispatched — batched through `IRaftBatchTransport.SendManyAsync` when the transport supports it, else per-frame. Followers therefore start persisting while the leader's own write is still in flight.
+2. **Persist off the loop.** `TakeStorageWrite()` produces a `StorageWrite` — the unstable entries, the changed hard state, any pending snapshot, and the responses to release once durable — which a background worker persists with a single `IRaftWritableStorage.Write` (one fsync covering entries + hard state). At most one write is outstanding; entries appended meanwhile are batched into the next write.
+3. **Acknowledge.** When the write completes, the worker posts a signal back onto the loop. The loop releases the held-back responses (a follower's append acknowledgement, a granted vote — never sent before the state they reflect is durable) and calls `AckStorageWrite`, which advances the stable log and, for a leader, its own match index (and hence the commit index). Gating the leader's match on durability is the safety counterpart of step 1's parallelism.
+4. **Apply.** Committed entries up to the **durable** stable index are applied to the `Committed` channel (conf-change entries are applied on the loop, via `Changer`, for ordering); the applied watermark advances. Commit may run ahead of the local disk, so apply never passes what has been persisted.
 
 ## Transport
 
-`IRaftTransport` delivers opaque, encoded message frames between nodes. Implementations:
+`IRaftTransport` delivers opaque, encoded message frames between nodes. The optional `IRaftBatchTransport` adds `SendManyAsync` so a cycle's outbound frames coalesce into one call. Implementations:
 
 - **`InMemoryNetwork`/`InMemoryTransport`** (package `RaftCs.Transport`) — a deterministic in-process bus with optional loss and partition injection for tests.
 - **`NanoMsgBusTransport`** (package `RaftCs.Transport.NanoMsg`) — a BUS-topology transport over NanoMsgSharp (managed nanomsg/NNG over tcp, tls, ipc, ws, inproc). The consensus layer filters frames by recipient id.
+
+## Flow control and overload protection
+
+The leader tracks each peer with a `Progress` whose `Inflights` ring bounds in-flight appends by both message count (`MaxInflightMessages`) and payload bytes (`MaxInflightBytes`), so a slow follower cannot force unbounded buffering. A separate **uncommitted-log byte cap** (`MaxUncommittedEntriesSize`) bounds the leader's accepted-but-not-yet-committed tail: when a quorum is lost and nothing commits, the tail fills and further proposals are dropped instead of growing the log without bound (a single proposal is always admitted when the tail is empty). With `CheckQuorum`, a leader that stops hearing from a majority steps down to follower. A follower with `DisableProposalForwarding` left off redirects client proposals to the leader it recognizes. All four default to raft-rs-compatible settings (forwarding on; check-quorum off; both caps unbounded).
 
 ## Performance
 

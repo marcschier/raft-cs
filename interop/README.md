@@ -70,3 +70,12 @@ isolated/non-isolated boundary; messages within each side continue to flow. `hea
 `tests/Raft.Interop.Tests` includes `interop/scenarios/**/*.json` as test data. The .NET parity tests should run the
 same scenario JSON through the managed Raft implementation and compare the resulting normalized trace with the
 generated `*.expected.json` files.
+
+## Adding scenarios for forwarding and check-quorum
+
+The optional optimizations (internal proposal forwarding, check-quorum step-down, byte flow control, the uncommitted-log
+cap, and asynchronous storage writes) are exercised by the unit and `RaftNode` integration suites in `tests/Raft.Tests`.
+Adding raft-rs **parity** scenarios for them requires extending the Rust harness and `schema.json` with the relevant
+config (for example `check_quorum` and `disable_proposal_forwarding`) and a leader-isolation step, then regenerating the
+golden traces with `cargo run --release -- self-test` and wiring the new names into `ScenarioParityTests`. Because the
+golden traces must be produced by raft-rs itself, they can only be regenerated where a Rust toolchain is available.

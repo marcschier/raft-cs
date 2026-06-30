@@ -25,7 +25,10 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | `PreVote` | `false` | Enable the disruption-free pre-vote protocol. |
 | `CheckQuorum` | `false` | Step down a leader without quorum contact. |
 | `MaxSizePerMessage` | `1 MiB` | Soft cap on append payload bytes. |
-| `MaxInflightMessages` | `256` | Per-peer in-flight append window. |
+| `MaxInflightMessages` | `256` | Per-peer in-flight append window (message count). |
+| `MaxInflightBytes` | `ulong.MaxValue` | Per-peer in-flight append window (payload bytes; max = unbounded). |
+| `MaxUncommittedEntriesSize` | `ulong.MaxValue` | Cap on uncommitted-log payload bytes a leader accepts (max = unbounded); guards against unbounded log growth when quorum is lost. |
+| `DisableProposalForwarding` | `false` | When `false`, a follower forwards proposals to the leader it recognizes. |
 | `RandomizedElectionTimeout` | `0` | Pin the election timeout (0 = randomized); set to make elections deterministic. |
 
 ## RaftNodeOptions
@@ -37,7 +40,12 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 
 ## RaftCore
 
-The deterministic engine, for embedding in a custom driver (the raft-rs `RawNode` analog). Feed it `Tick()` and `Step(Message)`; drain `TakeMessages()`, `UnstableEntries()`, `UnstableSnapshot()`, and `NextEntriesToApply()`; persist; then call `StableTo`, `StableSnapshotTo`, and `AppliedTo`. Apply committed conf-change entries by computing the new `ConfState` (via `Changer`) and calling `ApplyConfChange`.
+The deterministic engine, for embedding in a custom driver (the raft-rs `RawNode` analog). Feed it `Tick()` and `Step(Message)`. A custom driver can drive it two ways:
+
+- **Synchronous** — drain `TakeMessages()`, `UnstableEntries()`, `UnstableSnapshot()`, and `NextEntriesToApply()`; persist; then call `StableTo`, `StableSnapshotTo`, and `AppliedTo`.
+- **Asynchronous storage writes** (what `RaftNode` uses) — send `TakeSendNowMessages()` immediately, persist the `TakeStorageWrite()` batch off the loop with `IRaftWritableStorage.Write` and release its responses + call `AckStorageWrite` once durable, and apply `NextEntriesToApply()` (which never returns past the durable stable index). This lets a leader replicate in parallel with its own disk write.
+
+Apply committed conf-change entries by computing the new `ConfState` (via `Changer`) and calling `ApplyConfChange`.
 
 ## Storage
 
