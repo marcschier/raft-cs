@@ -19,12 +19,16 @@ public enum ProgressState : byte
 public sealed class Inflights
 {
     private readonly ulong[] _buffer;
+    private readonly ulong[] _sizes;
+    private readonly ulong _maxBytes;
     private int _start;
     private int _count;
+    private ulong _bytes;
 
     /// <summary>Initializes a new instance of the <see cref="Inflights"/> class.</summary>
     /// <param name="capacity">The maximum number of in-flight appends.</param>
-    public Inflights(int capacity)
+    /// <param name="maxBytes">The maximum payload bytes in flight (<see cref="ulong.MaxValue"/> = unlimited).</param>
+    public Inflights(int capacity, ulong maxBytes = ulong.MaxValue)
     {
 #if NET8_0_OR_GREATER
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
@@ -36,17 +40,21 @@ public sealed class Inflights
 #endif
 
         _buffer = new ulong[capacity];
+        _sizes = new ulong[capacity];
+        _maxBytes = maxBytes;
     }
 
-    /// <summary>Gets a value indicating whether the window is full.</summary>
-    public bool IsFull => _count == _buffer.Length;
+    /// <summary>Gets a value indicating whether the window is full (by message count or byte budget).</summary>
+    public bool IsFull =>
+        _count == _buffer.Length || (_maxBytes != ulong.MaxValue && _count > 0 && _bytes >= _maxBytes);
 
     /// <summary>Gets the number of in-flight appends.</summary>
     public int Count => _count;
 
     /// <summary>Records a new in-flight append whose last entry has index <paramref name="inflight"/>.</summary>
     /// <param name="inflight">The last index in the append message.</param>
-    public void Add(ulong inflight)
+    /// <param name="bytes">The payload bytes carried by the append message.</param>
+    public void Add(ulong inflight, ulong bytes = 0)
     {
         if (IsFull)
         {
@@ -60,6 +68,8 @@ public sealed class Inflights
         }
 
         _buffer[next] = inflight;
+        _sizes[next] = bytes;
+        _bytes += bytes;
         _count++;
     }
 
@@ -69,6 +79,7 @@ public sealed class Inflights
     {
         int freed = 0;
         int index = _start;
+        ulong freedBytes = 0;
         for (; freed < _count; freed++)
         {
             if (to < _buffer[index])
@@ -76,6 +87,7 @@ public sealed class Inflights
                 break;
             }
 
+            freedBytes += _sizes[index];
             index++;
             if (index >= _buffer.Length)
             {
@@ -84,7 +96,13 @@ public sealed class Inflights
         }
 
         _count -= freed;
+        _bytes -= freedBytes;
         _start = index;
+        if (_count == 0)
+        {
+            _start = 0;
+            _bytes = 0;
+        }
     }
 
     /// <summary>Frees the first in-flight append (used after a successful single probe).</summary>
@@ -103,6 +121,7 @@ public sealed class Inflights
     {
         _start = 0;
         _count = 0;
+        _bytes = 0;
     }
 }
 
@@ -111,11 +130,12 @@ public sealed class Progress
 {
     /// <summary>Initializes a new instance of the <see cref="Progress"/> class.</summary>
     /// <param name="nextIndex">The next log index to send to the peer.</param>
-    /// <param name="maxInflight">The flow-control window capacity.</param>
-    public Progress(ulong nextIndex, int maxInflight)
+    /// <param name="maxInflight">The flow-control window capacity (message count).</param>
+    /// <param name="maxInflightBytes">The flow-control window capacity in payload bytes.</param>
+    public Progress(ulong nextIndex, int maxInflight, ulong maxInflightBytes = ulong.MaxValue)
     {
         NextIndex = nextIndex;
-        Inflights = new Inflights(maxInflight);
+        Inflights = new Inflights(maxInflight, maxInflightBytes);
         State = ProgressState.Probe;
     }
 

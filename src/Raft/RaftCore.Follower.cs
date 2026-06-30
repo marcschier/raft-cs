@@ -36,6 +36,9 @@ public sealed partial class RaftCore
     {
         switch (message.Type)
         {
+            case MessageType.Propose:
+                ForwardProposalToLeader(message);
+                return;
             case MessageType.Append:
                 _electionElapsed = 0;
                 LeaderId = message.From;
@@ -55,6 +58,18 @@ public sealed partial class RaftCore
                 Campaign(CampaignType.Transfer);
                 return;
         }
+    }
+
+    private void ForwardProposalToLeader(Message message)
+    {
+        if (LeaderId == None || _disableProposalForwarding)
+        {
+            // No known leader to forward to, or forwarding disabled: drop the proposal.
+            return;
+        }
+
+        message.To = LeaderId;
+        Send(message);
     }
 
     private void HandleVoteResponse(Message message)

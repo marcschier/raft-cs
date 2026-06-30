@@ -14,8 +14,10 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private const byte EntryRecord = 0;
     private const byte TruncateRecord = 1;
     private const byte CompactRecord = 2;
+    private const byte HardStateRecord = 3;
     private const int LengthPrefixSize = 4;
     private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
+    private const int HardStateRecordSize = 1 + (3 * 8);
     private const int UInt64Size = 8;
 
     private readonly object _gate = new();
@@ -165,33 +167,80 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            ulong first = _entries[0].Index + 1;
-            ulong last = entries[entries.Count - 1].Index;
-            if (last < first)
+            if (AppendToLogLocked(entries))
             {
-                return;
-            }
-
-            int skip = first > entries[0].Index ? (int)(first - entries[0].Index) : 0;
-            ulong appendStart = entries[skip].Index;
-            int truncateAt = (int)(appendStart - _entries[0].Index);
-            WriteTruncateRecord(appendStart);
-            for (int i = skip; i < entries.Count; i++)
-            {
-                WriteEntryRecord(entries[i]);
-            }
-
-            FlushLog();
-            if (truncateAt < _entries.Count)
-            {
-                _entries.RemoveRange(truncateAt, _entries.Count - truncateAt);
-            }
-
-            for (int i = skip; i < entries.Count; i++)
-            {
-                _entries.Add(entries[i]);
+                FlushLog();
             }
         }
+    }
+
+    /// <summary>
+    /// Atomically appends entries, persists the (changed) hard state, and installs any snapshot with a single
+    /// durability sync covering the log. The common path (entries plus hard state, no snapshot) costs one fsync.
+    /// </summary>
+    /// <param name="entries">The entries to append (may be empty).</param>
+    /// <param name="hardState">The hard state to persist, or <see langword="null"/> when unchanged.</param>
+    /// <param name="snapshot">The snapshot to install, or <see langword="null"/> when none.</param>
+    public void Write(IReadOnlyList<Entry> entries, HardState? hardState, Snapshot? snapshot)
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+
+            if (snapshot is not null)
+            {
+                ApplySnapshotLocked(snapshot);
+            }
+
+            bool wroteLog = false;
+            if (entries is { Count: > 0 } && AppendToLogLocked(entries))
+            {
+                wroteLog = true;
+            }
+
+            if (hardState is { } hs)
+            {
+                _hardState = hs;
+                WriteHardStateRecord(hs);
+                wroteLog = true;
+            }
+
+            if (wroteLog)
+            {
+                FlushLog();
+            }
+        }
+    }
+
+    private bool AppendToLogLocked(IReadOnlyList<Entry> entries)
+    {
+        ulong first = _entries[0].Index + 1;
+        ulong last = entries[entries.Count - 1].Index;
+        if (last < first)
+        {
+            return false;
+        }
+
+        int skip = first > entries[0].Index ? (int)(first - entries[0].Index) : 0;
+        ulong appendStart = entries[skip].Index;
+        int truncateAt = (int)(appendStart - _entries[0].Index);
+        WriteTruncateRecord(appendStart);
+        for (int i = skip; i < entries.Count; i++)
+        {
+            WriteEntryRecord(entries[i]);
+        }
+
+        if (truncateAt < _entries.Count)
+        {
+            _entries.RemoveRange(truncateAt, _entries.Count - truncateAt);
+        }
+
+        for (int i = skip; i < entries.Count; i++)
+        {
+            _entries.Add(entries[i]);
+        }
+
+        return true;
     }
 
     /// <summary>Installs a snapshot, discarding the log it supersedes.</summary>
@@ -203,20 +252,26 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            ulong index = snapshot.Metadata.Index;
-            if (index <= _snapshot.Metadata.Index)
-            {
-                throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
-            }
-
-            WriteSnapshot(snapshot);
-            ResetLogFile();
-            _snapshot = CopySnapshot(snapshot);
-            _entries.Clear();
-            _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));
-            _hardState = new HardState(Math.Max(_hardState.Term, snapshot.Metadata.Term), _hardState.Vote, index);
-            WriteHardState();
+            ApplySnapshotLocked(snapshot);
         }
+    }
+
+    private void ApplySnapshotLocked(Snapshot snapshot)
+    {
+        ulong index = snapshot.Metadata.Index;
+        if (index <= _snapshot.Metadata.Index)
+        {
+            throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
+        }
+
+        WriteSnapshot(snapshot);
+        ResetLogFile();
+        _snapshot = CopySnapshot(snapshot);
+        _entries.Clear();
+        _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));
+        _hardState = new HardState(Math.Max(_hardState.Term, snapshot.Metadata.Term), _hardState.Vote, index);
+        WriteHardStateRecord(_hardState);
+        FlushLog();
     }
 
     /// <summary>Compacts the in-memory log up to (and excluding) <paramref name="compactIndex"/>.</summary>
@@ -241,7 +296,8 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         {
             ThrowIfDisposed();
             _hardState = hardState;
-            WriteHardState();
+            WriteHardStateRecord(hardState);
+            FlushLog();
         }
     }
 
@@ -503,6 +559,17 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 }
 
                 break;
+            case HardStateRecord:
+                if (payload.Length == HardStateRecordSize)
+                {
+                    int offset = 1;
+                    ulong term = ReadUInt64(payload, ref offset);
+                    ulong vote = ReadUInt64(payload, ref offset);
+                    ulong commit = ReadUInt64(payload, ref offset);
+                    _hardState = new HardState(term, vote, commit);
+                }
+
+                break;
         }
     }
 
@@ -545,6 +612,17 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         WriteRecord(payload);
     }
 
+    private void WriteHardStateRecord(HardState hardState)
+    {
+        Span<byte> payload = stackalloc byte[HardStateRecordSize];
+        payload[0] = HardStateRecord;
+        int offset = 1;
+        WriteUInt64(payload, ref offset, hardState.Term);
+        WriteUInt64(payload, ref offset, hardState.Vote);
+        WriteUInt64(payload, ref offset, hardState.Commit);
+        WriteRecord(payload);
+    }
+
     private void WriteEntryRecord(Entry entry)
     {
         int length = EntryHeaderSize + entry.Data.Length;
@@ -584,16 +662,6 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         _logStream.SetLength(0);
         _logStream.Seek(0, SeekOrigin.Begin);
         FlushLog();
-    }
-
-    private void WriteHardState()
-    {
-        byte[] data = new byte[24];
-        int offset = 0;
-        WriteUInt64(data, ref offset, _hardState.Term);
-        WriteUInt64(data, ref offset, _hardState.Vote);
-        WriteUInt64(data, ref offset, _hardState.Commit);
-        WriteAllBytesDurable(_hardStatePath, data);
     }
 
     private void WriteSnapshot(Snapshot snapshot)

@@ -5,7 +5,7 @@ using System.Threading.Channels;
 namespace Raft.Transport;
 
 /// <summary>An in-process transport bound to a node in an <see cref="InMemoryNetwork"/>.</summary>
-public sealed class InMemoryTransport : IRaftTransport
+public sealed class InMemoryTransport : IRaftBatchTransport
 {
     private readonly InMemoryNetwork _network;
     private readonly Channel<byte[]> _inbox;
@@ -57,6 +57,30 @@ public sealed class InMemoryTransport : IRaftTransport
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfDisposed();
         _network.Send(Id, recipient, frame);
+        return default;
+    }
+
+    /// <inheritdoc/>
+    public ValueTask SendManyAsync(
+        IReadOnlyList<OutboundFrame> frames,
+        CancellationToken cancellationToken = default)
+    {
+#if NET8_0_OR_GREATER
+        ArgumentNullException.ThrowIfNull(frames);
+#else
+        if (frames is null)
+        {
+            throw new ArgumentNullException(nameof(frames));
+        }
+#endif
+
+        cancellationToken.ThrowIfCancellationRequested();
+        ThrowIfDisposed();
+        for (int i = 0; i < frames.Count; i++)
+        {
+            _network.Send(Id, frames[i].Recipient, frames[i].Frame);
+        }
+
         return default;
     }
 

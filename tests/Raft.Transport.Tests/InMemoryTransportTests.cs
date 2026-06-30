@@ -49,6 +49,34 @@ public sealed class InMemoryTransportTests
     }
 
     [Test]
+    public async Task SendManyAsync_Delivers_All_Frames_To_Their_Recipients()
+    {
+        await using var network = new InMemoryNetwork();
+        var node1 = (IRaftBatchTransport)network.CreateNode(1);
+        IRaftTransport node2 = network.CreateNode(2);
+        IRaftTransport node3 = network.CreateNode(3);
+        List<byte[]> toTwo = [];
+        List<byte[]> toThree = [];
+        node2.FrameReceived += frame => toTwo.Add(frame.ToArray());
+        node3.FrameReceived += frame => toThree.Add(frame.ToArray());
+
+        await node1.StartAsync();
+        await node2.StartAsync();
+        await node3.StartAsync();
+        await node1.SendManyAsync(new OutboundFrame[]
+        {
+            new(2, new byte[] { 1 }),
+            new(3, new byte[] { 2 }),
+            new(2, new byte[] { 3 }),
+        });
+        await network.DrainAsync();
+
+        await Assert.That(toTwo.Count).IsEqualTo(2);
+        await Assert.That(toThree.Count).IsEqualTo(1);
+        await Assert.That(toThree[0]).IsEquivalentTo(new byte[] { 2 });
+    }
+
+    [Test]
     public async Task Partition_Drops_Cross_Partition_Frames_And_Heal_Restores()
     {
         await using var network = new InMemoryNetwork();

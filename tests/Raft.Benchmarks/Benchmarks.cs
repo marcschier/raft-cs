@@ -3,6 +3,7 @@
 using BenchmarkDotNet.Attributes;
 using Raft.Configuration;
 using Raft.Messages;
+using Raft.Progress;
 using Raft.Storage;
 
 namespace Raft.Benchmarks;
@@ -105,5 +106,75 @@ public class ReplicationBenchmarks
         {
             core.AppliedTo(toApply[toApply.Count - 1].Index);
         }
+    }
+}
+
+[MemoryDiagnoser]
+public class AsyncStorageWriteBenchmarks
+{
+    [Params(1000)]
+    public int Commands { get; set; }
+
+    [Benchmark]
+    public ulong ProposeAndCommitViaStorageWrites()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        var core = new RaftCore(new RaftConfig { Id = 1, RandomizedElectionTimeout = 10 }, storage);
+        core.Step(new Message { From = 1, Type = MessageType.Hup });
+        DrainViaStorageWrites(core, storage);
+
+        var payload = new byte[32];
+        for (int i = 0; i < Commands; i++)
+        {
+            core.Step(new Message
+            {
+                From = 1,
+                Type = MessageType.Propose,
+                Entries = new[] { new Entry(EntryType.Normal, 0, 0, payload) },
+            });
+            DrainViaStorageWrites(core, storage);
+        }
+
+        return core.CommitIndex;
+    }
+
+    private static void DrainViaStorageWrites(RaftCore core, MemoryStorage storage)
+    {
+        _ = core.TakeSendNowMessages();
+        StorageWrite? write = core.TakeStorageWrite();
+        while (write is not null)
+        {
+            storage.Write(write.Entries, write.HardState, write.Snapshot);
+            core.AckStorageWrite(write);
+
+            IReadOnlyList<Entry> toApply = core.NextEntriesToApply();
+            if (toApply.Count > 0)
+            {
+                core.AppliedTo(toApply[toApply.Count - 1].Index);
+            }
+
+            _ = core.TakeSendNowMessages();
+            write = core.TakeStorageWrite();
+        }
+    }
+}
+
+[MemoryDiagnoser]
+public class FlowControlBenchmarks
+{
+    [Params(256)]
+    public int Window { get; set; }
+
+    [Benchmark]
+    public int InflightsAddAndFreeCycle()
+    {
+        var inflights = new Inflights(Window, (ulong)Window * 64);
+        for (ulong i = 1; i <= (ulong)Window; i++)
+        {
+            inflights.Add(i, 64);
+        }
+
+        inflights.FreeLatestEntries((ulong)Window);
+        return inflights.Count;
     }
 }

@@ -199,6 +199,12 @@ internal sealed class RaftLog
 
     internal void StableSnapshotTo(ulong index) => _unstable.StableSnapshotTo(index);
 
+    /// <summary>
+    /// The highest log index that is durable in stable storage. Entries above this index live only in the unstable
+    /// tail and may not yet have been written to disk, so the state machine must not apply past it.
+    /// </summary>
+    internal ulong StableIndex => _unstable.Offset - 1;
+
     internal IReadOnlyList<Entry> Slice(ulong low, ulong high, ulong maxBytes)
     {
         if (low == high)
@@ -248,9 +254,13 @@ internal sealed class RaftLog
     internal IReadOnlyList<Entry> NextEntries(ulong maxBytes)
     {
         ulong offset = Math.Max(Applied + 1, FirstIndex());
-        if (Committed + 1 > offset)
+
+        // Never apply past what is durable on local storage: with asynchronous storage writes the commit index can run
+        // ahead of the on-disk log, and applying un-persisted entries would not survive a crash.
+        ulong high = Math.Min(Committed, StableIndex) + 1;
+        if (high > offset)
         {
-            return Slice(offset, Committed + 1, maxBytes);
+            return Slice(offset, high, maxBytes);
         }
 
         return Array.Empty<Entry>();
@@ -259,7 +269,7 @@ internal sealed class RaftLog
     internal bool HasNextEntries()
     {
         ulong offset = Math.Max(Applied + 1, FirstIndex());
-        return Committed + 1 > offset;
+        return Math.Min(Committed, StableIndex) + 1 > offset;
     }
 
     internal Snapshot SnapshotForRequest(ulong requestIndex)

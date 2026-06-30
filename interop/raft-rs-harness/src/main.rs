@@ -4,7 +4,7 @@ use raft::eraftpb::{Entry, EntryType, Message};
 use raft::prelude::ConfState;
 use raft::raw_node::{RawNode, Ready};
 use raft::storage::MemStorage;
-use raft::{Config, StateRole, Storage};
+use raft::{Config, StateRole};
 use serde::{Deserialize, Serialize};
 use slog::{o, Discard, Logger};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -37,6 +37,8 @@ struct Scenario {
     nodes: Vec<u64>,
     election_ticks: BTreeMap<String, usize>,
     heartbeat_ticks: usize,
+    #[serde(default)]
+    check_quorum: bool,
     steps: Vec<Step>,
 }
 
@@ -101,7 +103,7 @@ impl Harness {
                 max_election_tick: election_tick + 1,
                 max_size_per_msg: 1_048_576,
                 max_inflight_msgs: 256,
-                check_quorum: false,
+                check_quorum: scenario.check_quorum,
                 pre_vote: false,
                 ..Config::default()
             };
@@ -363,7 +365,6 @@ fn scenario_dir() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
-        .and_then(Path::parent)
         .map(|path| path.join("scenarios"))
         .ok_or_else(|| HarnessError::Scenario("cannot locate interop/scenarios".to_owned()))
 }

@@ -21,13 +21,18 @@ public sealed partial class RaftCore
     private readonly RaftLog _log;
     private readonly ProgressTracker _tracker;
     private readonly List<Message> _msgs = new();
+    private readonly List<Message> _msgsAfterAppend = new();
     private readonly Random _rng;
     private readonly ulong _maxSizePerMessage;
+    private readonly ulong _maxUncommittedSize;
+    private readonly bool _disableProposalForwarding;
+    private ulong _uncommittedSize;
 
     private int _electionElapsed;
     private int _heartbeatElapsed;
     private int _randomizedElectionTimeout;
     private readonly int _fixedElectionTimeout;
+    private HardState _prevHardState;
 
     /// <summary>Initializes a new instance of the <see cref="RaftCore"/> class.</summary>
     /// <param name="config">The node configuration.</param>
@@ -44,9 +49,11 @@ public sealed partial class RaftCore
         PreVote = config.PreVote;
         CheckQuorum = config.CheckQuorum;
         _maxSizePerMessage = config.MaxSizePerMessage;
+        _maxUncommittedSize = config.MaxUncommittedEntriesSize;
+        _disableProposalForwarding = config.DisableProposalForwarding;
         _rng = new Random(unchecked((int)(config.Id * 2654435761u)));
         _log = new RaftLog(storage);
-        _tracker = new ProgressTracker(config.MaxInflightMessages);
+        _tracker = new ProgressTracker(config.MaxInflightMessages, config.MaxInflightBytes);
 
         (HardState hardState, ConfState confState) = storage.InitialState();
         _tracker.ApplyConf(confState, 1);
@@ -64,6 +71,8 @@ public sealed partial class RaftCore
         {
             _randomizedElectionTimeout = _fixedElectionTimeout;
         }
+
+        _prevHardState = HardState;
     }
 
     /// <summary>Gets this node's id.</summary>
@@ -103,6 +112,11 @@ public sealed partial class RaftCore
 
     internal ulong PendingConfIndex { get; private set; }
 
+    internal ulong UncommittedSize => _uncommittedSize;
+
+    /// <summary>Gets the highest log index applied to the state machine.</summary>
+    public ulong Applied => _log.Applied;
+
     /// <summary>Gets the highest committed log index.</summary>
     public ulong CommitIndex => _log.Committed;
 
@@ -112,9 +126,35 @@ public sealed partial class RaftCore
     /// <summary>Gets this node's durable hard state.</summary>
     public HardState HardState => new(Term, Vote, _log.Committed);
 
-    /// <summary>Removes and returns the messages queued for transmission since the last drain.</summary>
+    /// <summary>
+    /// Removes and returns the messages queued for transmission since the last drain, including both immediately
+    /// sendable messages and durability-gated responses. This is the synchronous-driver entry point; callers that
+    /// persist before draining (so responses are released only after the write is durable) use this. Asynchronous
+    /// drivers instead pair <see cref="TakeSendNowMessages"/> with <see cref="TakeStorageWrite"/>.
+    /// </summary>
     /// <returns>The outbound messages.</returns>
     public IReadOnlyList<Message> TakeMessages()
+    {
+        if (_msgs.Count == 0 && _msgsAfterAppend.Count == 0)
+        {
+            return Array.Empty<Message>();
+        }
+
+        var taken = new List<Message>(_msgs.Count + _msgsAfterAppend.Count);
+        taken.AddRange(_msgs);
+        taken.AddRange(_msgsAfterAppend);
+        _msgs.Clear();
+        _msgsAfterAppend.Clear();
+        return taken;
+    }
+
+    /// <summary>
+    /// Removes and returns only the messages that may be sent immediately, before the unstable log and hard state are
+    /// made durable (leader appends/heartbeats, vote requests, snapshots, timeout-now). Durability-gated responses are
+    /// carried by <see cref="TakeStorageWrite"/> instead.
+    /// </summary>
+    /// <returns>The immediately sendable messages.</returns>
+    public IReadOnlyList<Message> TakeSendNowMessages()
     {
         if (_msgs.Count == 0)
         {
@@ -124,6 +164,67 @@ public sealed partial class RaftCore
         var taken = _msgs.ToArray();
         _msgs.Clear();
         return taken;
+    }
+
+    /// <summary>
+    /// Drains the next durable write: the unstable entries to append, the hard state (when changed since the last
+    /// write), the pending snapshot, and the responses to release once the write is durable. Returns
+    /// <see langword="null"/> when there is nothing to persist or release. The driver persists the returned write and
+    /// then calls <see cref="AckStorageWrite"/>. At most one write should be outstanding at a time.
+    /// </summary>
+    /// <returns>The pending storage write, or <see langword="null"/>.</returns>
+    public StorageWrite? TakeStorageWrite()
+    {
+        IReadOnlyList<Entry> entries = _log.UnstableEntries;
+        Snapshot? snapshot = _log.UnstableSnapshot;
+        HardState current = HardState;
+        bool hardChanged = current != _prevHardState;
+
+        if (entries.Count == 0 && snapshot is null && !hardChanged && _msgsAfterAppend.Count == 0)
+        {
+            return null;
+        }
+
+        Message[] responses = _msgsAfterAppend.Count == 0
+            ? Array.Empty<Message>()
+            : _msgsAfterAppend.ToArray();
+        _msgsAfterAppend.Clear();
+
+        Entry[] toPersist = entries.Count == 0 ? Array.Empty<Entry>() : new Entry[entries.Count];
+        for (int i = 0; i < entries.Count; i++)
+        {
+            toPersist[i] = entries[i];
+        }
+
+        ulong lastIndex = toPersist.Length > 0 ? toPersist[toPersist.Length - 1].Index : 0;
+        ulong lastTerm = toPersist.Length > 0 ? toPersist[toPersist.Length - 1].Term : 0;
+        ulong snapshotIndex = snapshot?.Metadata.Index ?? 0;
+        HardState? hardState = hardChanged ? current : null;
+        if (hardChanged)
+        {
+            _prevHardState = current;
+        }
+
+        return new StorageWrite(toPersist, hardState, snapshot, responses, lastIndex, lastTerm, snapshotIndex);
+    }
+
+    /// <summary>
+    /// Acknowledges that a previously taken <see cref="StorageWrite"/> is durable, advancing the stable log and (for a
+    /// leader) its own match index, which may in turn advance the commit index and trigger further replication.
+    /// </summary>
+    /// <param name="write">The write that has been persisted.</param>
+    public void AckStorageWrite(StorageWrite write)
+    {
+        Internal.Check.NotNull(write);
+        if (write.SnapshotIndex != 0)
+        {
+            StableSnapshotTo(write.SnapshotIndex);
+        }
+
+        if (write.LastEntryIndex != 0)
+        {
+            StableTo(write.LastEntryIndex, write.LastEntryTerm);
+        }
     }
 
     /// <summary>Returns the entries appended since the last stable point that must be persisted.</summary>
@@ -141,7 +242,22 @@ public sealed partial class RaftCore
     /// <summary>Marks the log persisted up to <paramref name="index"/> at <paramref name="term"/>.</summary>
     /// <param name="index">The highest persisted index.</param>
     /// <param name="term">The term at <paramref name="index"/>.</param>
-    public void StableTo(ulong index, ulong term) => _log.StableEntriesTo(index, term);
+    public void StableTo(ulong index, ulong term)
+    {
+        _log.StableEntriesTo(index, term);
+
+        // The leader counts its own log entries toward commit only once they are durable on its disk. This is what
+        // lets the driver replicate to followers in parallel with the leader's local write (etcd's "writing to the
+        // leader's disk in parallel").
+        if (Role == RaftRole.Leader && index != 0)
+        {
+            Raft.Progress.Progress? self = _tracker.GetProgress(Id);
+            if (self is not null && self.MaybeUpdate(index) && MaybeCommit())
+            {
+                BcastAppend();
+            }
+        }
+    }
 
     /// <summary>Marks the pending snapshot persisted.</summary>
     /// <param name="index">The snapshot index.</param>
@@ -395,6 +511,7 @@ public sealed partial class RaftCore
         Reset(Term);
         LeaderId = Id;
         Role = RaftRole.Leader;
+        _uncommittedSize = 0;
 
         PendingConfIndex = _log.LastIndex();
         var noop = new Entry(EntryType.Normal, Term, _log.LastIndex() + 1, ReadOnlyMemory<byte>.Empty);
@@ -508,7 +625,19 @@ public sealed partial class RaftCore
             message.From = Id;
         }
 
-        _msgs.Add(message);
+        // Responses that reflect newly durable state (a follower acknowledging appended entries, or a node granting a
+        // vote) must not be released until the unstable log and hard state are persisted. They are queued separately
+        // and carried by TakeStorageWrite so the asynchronous driver can hold them back until the write completes.
+        if (message.Type is MessageType.AppendResponse
+            or MessageType.RequestVoteResponse
+            or MessageType.RequestPreVoteResponse)
+        {
+            _msgsAfterAppend.Add(message);
+        }
+        else
+        {
+            _msgs.Add(message);
+        }
     }
 
     private enum CampaignType

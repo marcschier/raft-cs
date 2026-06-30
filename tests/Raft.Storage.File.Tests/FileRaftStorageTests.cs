@@ -203,6 +203,88 @@ public sealed class FileRaftStorageTests
         }
     }
 
+    [Test]
+    public async Task Write_PersistsEntriesAndHardState_AndReplays()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var hardState = new HardState(7, 1, 3);
+            Entry[] entries = CreateEntries(1, 3);
+
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Write(entries, hardState, null);
+
+                await Assert.That(storage.LastIndex()).IsEqualTo(3UL);
+                (HardState hs, _) = storage.InitialState();
+                await Assert.That(hs).IsEqualTo(hardState);
+            }
+
+            using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                (HardState hs, _) = reopened.InitialState();
+                await Assert.That(hs).IsEqualTo(hardState);
+                await Assert.That(reopened.LastIndex()).IsEqualTo(3UL);
+                await AssertEntriesEqual(reopened.Entries(1, 4, ulong.MaxValue), entries);
+            }
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Write_WithSnapshotEntriesAndHardState_MatchesMemoryStorage()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using var file = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            var memory = new MemoryStorage();
+            var snapshot = new Snapshot(
+                new SnapshotMetadata(2, 5, new Configuration.ConfState(TwoVoters)),
+                new byte[] { 1, 2 });
+            Entry[] tail = CreateEntries(3, 2);
+            var hardState = new HardState(5, 2, 3);
+
+            file.Write(tail, hardState, snapshot);
+            memory.Write(tail, hardState, snapshot);
+
+            await AssertStoresEqual(memory, file);
+            await Assert.That(file.LastIndex()).IsEqualTo(4UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Write_HardStateOnly_SurvivesReopen()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var hardState = new HardState(9, 3, 0);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Write(Array.Empty<Entry>(), hardState, null);
+            }
+
+            using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                (HardState hs, _) = reopened.InitialState();
+                await Assert.That(hs).IsEqualTo(hardState);
+            }
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
     private static Entry[] CreateEntries(ulong start, int count)
     {
         var entries = new Entry[count];

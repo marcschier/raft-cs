@@ -16,6 +16,8 @@ public sealed class ScenarioParityTests
     [Arguments("three-node-election")]
     [Arguments("three-node-replicate")]
     [Arguments("leader-failover")]
+    [Arguments("forward-proposal")]
+    [Arguments("check-quorum-step-down")]
     public async Task Scenario_MatchesRaftRsGoldenTrace(string name)
     {
         string directory = Path.Combine(AppContext.BaseDirectory, "scenarios");

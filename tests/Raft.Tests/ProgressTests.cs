@@ -37,6 +37,61 @@ public sealed class ProgressTests
     }
 
     [Test]
+    public async Task Inflights_ByteWindow_FullByBytesBeforeCount()
+    {
+        var inflights = new Inflights(10, maxBytes: 100);
+        inflights.Add(1, 60);
+        await Assert.That(inflights.IsFull).IsFalse();
+
+        inflights.Add(2, 60);
+        await Assert.That(inflights.Count).IsEqualTo(2);
+        await Assert.That(inflights.IsFull).IsTrue();
+
+        inflights.FreeLatestEntries(1);
+        await Assert.That(inflights.IsFull).IsFalse();
+
+        inflights.Add(3, 60);
+        await Assert.That(inflights.IsFull).IsTrue();
+    }
+
+    [Test]
+    public async Task Inflights_ByteWindow_Unlimited_NeverFullByBytes()
+    {
+        var inflights = new Inflights(3);
+        inflights.Add(1, ulong.MaxValue / 2);
+        inflights.Add(2, ulong.MaxValue / 2);
+        await Assert.That(inflights.IsFull).IsFalse();
+        inflights.Add(3, 1);
+        await Assert.That(inflights.IsFull).IsTrue();
+    }
+
+    [Test]
+    public async Task Inflights_ByteWindow_FreeResetsBytes()
+    {
+        var inflights = new Inflights(4, maxBytes: 50);
+        inflights.Add(1, 30);
+        inflights.Add(2, 20);
+        await Assert.That(inflights.IsFull).IsTrue();
+
+        inflights.FreeLatestEntries(2);
+        await Assert.That(inflights.Count).IsEqualTo(0);
+        await Assert.That(inflights.IsFull).IsFalse();
+
+        inflights.Add(3, 40);
+        await Assert.That(inflights.IsFull).IsFalse();
+    }
+
+    [Test]
+    public async Task Progress_IsPaused_WhenByteWindowFull()
+    {
+        var progress = new ProgressPeer(1, 16, maxInflightBytes: 100);
+        progress.MaybeUpdate(0);
+        progress.BecomeReplicate();
+        progress.Inflights.Add(1, 100);
+        await Assert.That(progress.IsPaused()).IsTrue();
+    }
+
+    [Test]
     public async Task Progress_MaybeUpdate_AdvancesMatchAndNext()
     {
         var progress = new ProgressPeer(1, 8);

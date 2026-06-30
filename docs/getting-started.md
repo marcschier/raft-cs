@@ -63,15 +63,68 @@ await leader.ChangeConfigurationAsync(ConfChangeV2.Single(ConfChangeType.AddNode
 await leader.TransferLeadershipAsync(targetId: 2);
 ```
 
+## Observe leadership and membership
+
+Besides the `Committed` command stream, a node pushes leadership and membership changes so you do not have to poll:
+
+```csharp
+// React to becoming / losing leadership (baseline state is delivered first).
+_ = Task.Run(async () =>
+{
+    await foreach (RaftStateChange change in node.StateChanges.ReadAllAsync())
+    {
+        Console.WriteLine(change.IsLeader ? $"became leader (term {change.Term})" : $"following {change.LeaderId}");
+    }
+});
+
+// Reconcile against committed membership.
+await foreach (ConfState membership in node.CommittedConfigurations.ReadAllAsync())
+{
+    Console.WriteLine($"voters: {string.Join(",", membership.Voters)}");
+}
+```
+
+The current values are also available synchronously: `node.IsLeader`, `node.LeaderId`, `node.Term`, `node.Role`, `node.CommitIndex`, `node.AppliedIndex`, and `node.Configuration`.
+
+## Bound the log (compaction)
+
+The log grows with every committed command. Once your state machine has durably applied entries up to some index, discard the prefix so the on-disk log stays bounded:
+
+```csharp
+// After persisting your state-machine state covering everything up to node.AppliedIndex:
+await node.CompactAsync(node.AppliedIndex);
+```
+
+`CompactAsync` runs on the node's driver loop, so it is safe to call from any thread. A follower that falls behind the compacted boundary is re-seeded with a snapshot automatically — see [Snapshots and compaction](adoption.md#snapshots-and-log-compaction) for how to make snapshots carry your application state.
+
 ## Persist across restarts
 
 Swap `MemoryStorage` for `FileRaftStorage` (package `RaftCs.Storage.File`) to durably persist the log, hard state, and snapshots:
 
 ```csharp
-using var storage = new FileRaftStorage(new FileRaftStorageOptions { Directory = "/var/lib/raft/node1" });
+using Raft.Storage.File;
+
+using var storage = new FileRaftStorage(new FileRaftStorageOptions("/var/lib/raft/node1") { Fsync = true });
+```
+
+Unlike `MemoryStorage(ConfState)`, a *fresh* `FileRaftStorage` starts with **empty membership** — there is no `ConfState` constructor. When you bootstrap a brand-new cluster, seed the initial membership once (on every node, with the same set) before constructing the `RaftNode`, or the node never knows it is a voter and never campaigns:
+
+```csharp
+using var storage = new FileRaftStorage(new FileRaftStorageOptions("/var/lib/raft/node1"));
+if (storage.InitialState().ConfState.Voters.Count == 0)
+{
+    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 })); // bootstrap once
+}
+
 var node = new RaftNode(config, storage, transport);
 ```
+
+On a **restart**, the membership, log, and hard state are recovered from disk automatically — do not re-seed; just construct the node.
 
 ## Determinism for testing
 
 Set `RaftConfig.RandomizedElectionTimeout` to pin a node's election timeout (the smallest one wins), which makes election outcomes deterministic in tests and the behavioral-parity harness.
+
+## Next steps
+
+For running a real cluster — building a state machine, bootstrapping, snapshots and log compaction, cross-machine transports, the threading model, and operational guidance — see the **[Adoption guide](adoption.md)**.

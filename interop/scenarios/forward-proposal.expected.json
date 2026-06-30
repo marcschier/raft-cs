@@ -1,0 +1,25 @@
+{
+  "name": "forward-proposal",
+  "leader": 1,
+  "term": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "committed": [
+        "via-follower"
+      ]
+    },
+    {
+      "id": 2,
+      "committed": [
+        "via-follower"
+      ]
+    },
+    {
+      "id": 3,
+      "committed": [
+        "via-follower"
+      ]
+    }
+  ]
+}

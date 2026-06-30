@@ -12,8 +12,12 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | `ValueTask ChangeConfigurationAsync(ConfChangeV2, CancellationToken)` | Proposes a membership change. |
 | `ValueTask TransferLeadershipAsync(ulong targetId, CancellationToken)` | Requests leadership transfer (leader only). |
 | `ValueTask CampaignAsync(CancellationToken)` | Forces an immediate election campaign. |
+| `Task CompactAsync(ulong index, CancellationToken)` | Discards the applied log prefix before `index` (on the loop; thread-safe). |
 | `ChannelReader<ReadOnlyMemory<byte>> Committed` | Committed application commands, in log order. |
-| `ulong Id`, `ulong LeaderId`, `ulong Term`, `ulong CommitIndex`, `RaftRole Role`, `bool IsLeader` | Observable state. |
+| `ChannelReader<RaftStateChange> StateChanges` | Leadership/role transitions (baseline first, then on leader-id/role change). |
+| `ChannelReader<ConfState> CommittedConfigurations` | Committed cluster configurations (baseline first, then on each membership change). |
+| `ConfState Configuration` | The most recently committed cluster configuration. |
+| `ulong Id`, `ulong LeaderId`, `ulong Term`, `ulong CommitIndex`, `ulong AppliedIndex`, `RaftRole Role`, `bool IsLeader` | Observable state. |
 
 ## RaftConfig
 
@@ -25,7 +29,10 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | `PreVote` | `false` | Enable the disruption-free pre-vote protocol. |
 | `CheckQuorum` | `false` | Step down a leader without quorum contact. |
 | `MaxSizePerMessage` | `1 MiB` | Soft cap on append payload bytes. |
-| `MaxInflightMessages` | `256` | Per-peer in-flight append window. |
+| `MaxInflightMessages` | `256` | Per-peer in-flight append window (message count). |
+| `MaxInflightBytes` | `ulong.MaxValue` | Per-peer in-flight append window (payload bytes; max = unbounded). |
+| `MaxUncommittedEntriesSize` | `ulong.MaxValue` | Cap on uncommitted-log payload bytes a leader accepts (max = unbounded); guards against unbounded log growth when quorum is lost. |
+| `DisableProposalForwarding` | `false` | When `false`, a follower forwards proposals to the leader it recognizes. |
 | `RandomizedElectionTimeout` | `0` | Pin the election timeout (0 = randomized); set to make elections deterministic. |
 
 ## RaftNodeOptions
@@ -34,10 +41,16 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | --- | --- | --- |
 | `TickInterval` | `50 ms` | Wall-clock interval between logical ticks. |
 | `MaxApplyBytes` | `16 MiB` | Soft cap on committed bytes applied per cycle. |
+| `StateObservationCapacity` | `256` | Buffer for the `StateChanges`/`CommittedConfigurations` streams; oldest items drop when a consumer falls behind, so the latest value is always retained. |
 
 ## RaftCore
 
-The deterministic engine, for embedding in a custom driver (the raft-rs `RawNode` analog). Feed it `Tick()` and `Step(Message)`; drain `TakeMessages()`, `UnstableEntries()`, `UnstableSnapshot()`, and `NextEntriesToApply()`; persist; then call `StableTo`, `StableSnapshotTo`, and `AppliedTo`. Apply committed conf-change entries by computing the new `ConfState` (via `Changer`) and calling `ApplyConfChange`.
+The deterministic engine, for embedding in a custom driver (the raft-rs `RawNode` analog). Feed it `Tick()` and `Step(Message)`. A custom driver can drive it two ways:
+
+- **Synchronous** — drain `TakeMessages()`, `UnstableEntries()`, `UnstableSnapshot()`, and `NextEntriesToApply()`; persist; then call `StableTo`, `StableSnapshotTo`, and `AppliedTo`.
+- **Asynchronous storage writes** (what `RaftNode` uses) — send `TakeSendNowMessages()` immediately, persist the `TakeStorageWrite()` batch off the loop with `IRaftWritableStorage.Write` and release its responses + call `AckStorageWrite` once durable, and apply `NextEntriesToApply()` (which never returns past the durable stable index). This lets a leader replicate in parallel with its own disk write.
+
+Apply committed conf-change entries by computing the new `ConfState` (via `Changer`) and calling `ApplyConfChange`.
 
 ## Storage
 

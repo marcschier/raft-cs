@@ -33,6 +33,9 @@
       "type": "integer",
       "minimum": 1
     },
+    "check_quorum": {
+      "type": "boolean"
+    },
     "steps": {
       "type": "array",
       "items": {

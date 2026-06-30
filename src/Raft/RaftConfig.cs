@@ -23,8 +23,28 @@ public sealed class RaftConfig
     /// <summary>Gets or sets the soft maximum total payload bytes per append message.</summary>
     public ulong MaxSizePerMessage { get; set; } = 1024 * 1024;
 
-    /// <summary>Gets or sets the per-peer in-flight append window capacity.</summary>
+    /// <summary>Gets or sets the per-peer in-flight append window capacity (message count).</summary>
     public int MaxInflightMessages { get; set; } = 256;
+
+    /// <summary>
+    /// Gets or sets the per-peer in-flight append window capacity in payload bytes. The default
+    /// (<see cref="ulong.MaxValue"/>) leaves the byte window unbounded, so only
+    /// <see cref="MaxInflightMessages"/> throttles replication (raft-rs parity).
+    /// </summary>
+    public ulong MaxInflightBytes { get; set; } = ulong.MaxValue;
+
+    /// <summary>
+    /// Gets or sets the soft cap on the total payload bytes of uncommitted entries a leader will accept before
+    /// rejecting new proposals. The default (<see cref="ulong.MaxValue"/>) disables the cap (raft-rs parity); a single
+    /// entry is always admitted when no uncommitted entries are outstanding.
+    /// </summary>
+    public ulong MaxUncommittedEntriesSize { get; set; } = ulong.MaxValue;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether a follower forwards client proposals it receives to the leader. When
+    /// <see langword="false"/> (the default), a follower internally redirects proposals to the leader it recognizes.
+    /// </summary>
+    public bool DisableProposalForwarding { get; set; }
 
     /// <summary>
     /// Gets or sets a fixed randomized election timeout (in ticks). When zero, the timeout is chosen deterministically
@@ -52,6 +72,19 @@ public sealed class RaftConfig
         if (MaxInflightMessages <= 0)
         {
             throw new ArgumentException("MaxInflightMessages must be positive.", nameof(MaxInflightMessages));
+        }
+
+        if (MaxInflightBytes == 0)
+        {
+            throw new ArgumentException(
+                "MaxInflightBytes must be positive (use ulong.MaxValue for unlimited).", nameof(MaxInflightBytes));
+        }
+
+        if (MaxUncommittedEntriesSize == 0)
+        {
+            throw new ArgumentException(
+                "MaxUncommittedEntriesSize must be positive (use ulong.MaxValue for unlimited).",
+                nameof(MaxUncommittedEntriesSize));
         }
     }
 }

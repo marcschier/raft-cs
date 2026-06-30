@@ -239,5 +239,30 @@ public sealed class MemoryStorage : IRaftWritableStorage
         }
     }
 
+    /// <summary>
+    /// Atomically persists a snapshot, a batch of entries, and the hard state. For the volatile in-memory store this
+    /// simply forwards to the granular methods in snapshot/entries/hard-state order.
+    /// </summary>
+    /// <param name="entries">The entries to append (may be empty).</param>
+    /// <param name="hardState">The hard state to persist, or <see langword="null"/> when unchanged.</param>
+    /// <param name="snapshot">The snapshot to install, or <see langword="null"/> when none.</param>
+    public void Write(IReadOnlyList<Entry> entries, HardState? hardState, Snapshot? snapshot)
+    {
+        if (snapshot is not null)
+        {
+            ApplySnapshot(snapshot);
+        }
+
+        if (entries is { Count: > 0 })
+        {
+            Append(entries);
+        }
+
+        if (hardState is { } hs)
+        {
+            SetHardState(hs);
+        }
+    }
+
     private ulong LastIndexLocked() => _entries[0].Index + (ulong)_entries.Count - 1;
 }

@@ -11,7 +11,7 @@ namespace Raft.Transport.NanoMsg;
 /// BUS delivers each sent frame to directly connected peers and does not echo a node's own sends. The Raft
 /// consensus layer is responsible for filtering by recipient id; <see cref="SendAsync"/> ignores its routing hint.
 /// </remarks>
-public sealed class NanoMsgBusTransport : IRaftTransport
+public sealed class NanoMsgBusTransport : IRaftBatchTransport
 {
     private readonly NanoMsgBusTransportOptions _options;
     private readonly object _gate = new();
@@ -142,6 +142,45 @@ public sealed class NanoMsgBusTransport : IRaftTransport
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested && IsTransientFault(ex))
         {
+        }
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask SendManyAsync(
+        IReadOnlyList<OutboundFrame> frames,
+        CancellationToken cancellationToken = default)
+    {
+#if NET8_0_OR_GREATER
+        ArgumentNullException.ThrowIfNull(frames);
+#else
+        if (frames is null)
+        {
+            throw new ArgumentNullException(nameof(frames));
+        }
+#endif
+
+        BusSocket? socket = Volatile.Read(ref _socket);
+        if (socket is null)
+        {
+            throw new InvalidOperationException("The transport has not started.");
+        }
+
+        for (int i = 0; i < frames.Count; i++)
+        {
+            ReadOnlyMemory<byte> frame = frames[i].Frame;
+            if (frame.Length > _options.MaxFrameLength)
+            {
+                throw new ArgumentException(
+                    "The frame is larger than the maximum frame length.", nameof(frames));
+            }
+
+            try
+            {
+                await socket.SendAsync(frame, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested && IsTransientFault(ex))
+            {
+            }
         }
     }
 

@@ -11,8 +11,8 @@ public sealed partial class RaftCore
 {
     /// <summary>Appends entries to the local log as the leader, stamping term and contiguous indices.</summary>
     /// <param name="entries">The entries to append (term/index are assigned here).</param>
-    /// <returns>The new last log index.</returns>
-    internal ulong AppendEntries(IReadOnlyList<Entry> entries)
+    /// <returns><see langword="true"/> when accepted, or <see langword="false"/> when the cap rejects it.</returns>
+    internal bool AppendEntries(IReadOnlyList<Entry> entries)
     {
         ulong lastIndex = _log.LastIndex();
         var stamped = new Entry[entries.Count];
@@ -22,21 +22,71 @@ public sealed partial class RaftCore
             stamped[i] = new Entry(source.Type, Term, lastIndex + 1 + (ulong)i, source.Data);
         }
 
-        ulong newLast = _log.Append(stamped);
-        Raft.Progress.Progress? self = _tracker.GetProgress(Id);
-        if (self is not null)
+        if (!IncreaseUncommittedSize(stamped))
         {
-            self.MaybeUpdate(newLast);
+            // Drop the proposal: the uncommitted tail of the log is at its configured byte cap.
+            return false;
         }
 
+        _log.Append(stamped);
+
+        // NOTE: the leader's own match index is advanced in StableTo, once these entries are durable, rather than here
+        // at append time. This gates the leader's commit contribution on its local disk write completing.
         MaybeCommit();
-        return newLast;
+        return true;
     }
 
     private bool MaybeCommit()
     {
+        ulong oldCommit = _log.Committed;
         ulong mci = _tracker.Committed();
-        return _log.TryMaybeCommit(mci, Term);
+        if (!_log.TryMaybeCommit(mci, Term))
+        {
+            return false;
+        }
+
+        if (_uncommittedSize > 0)
+        {
+            // Entries that just committed no longer count against the uncommitted-log byte cap.
+            IReadOnlyList<Entry> committed = _log.Slice(oldCommit + 1, _log.Committed + 1, ulong.MaxValue);
+            ReduceUncommittedSize(committed);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Tracks the payload bytes of newly proposed entries against the uncommitted-log cap. Returns
+    /// <see langword="false"/> (drop the proposal) when admitting these entries would exceed the cap, except that a
+    /// proposal is always admitted when no uncommitted entries are currently outstanding.
+    /// </summary>
+    /// <param name="entries">The entries being appended.</param>
+    /// <returns><see langword="true"/> when the entries are admitted.</returns>
+    private bool IncreaseUncommittedSize(IReadOnlyList<Entry> entries)
+    {
+        ulong size = PayloadsSize(entries);
+        if (_uncommittedSize > 0 && size > 0 && _uncommittedSize + size > _maxUncommittedSize)
+        {
+            return false;
+        }
+
+        _uncommittedSize += size;
+        return true;
+    }
+
+    /// <summary>Reduces the uncommitted-log byte tally as entries commit, saturating at zero.</summary>
+    /// <param name="entries">The entries leaving the uncommitted tail.</param>
+    private void ReduceUncommittedSize(IReadOnlyList<Entry> entries)
+    {
+        ulong size = PayloadsSize(entries);
+        if (size > _uncommittedSize)
+        {
+            _uncommittedSize = 0;
+        }
+        else
+        {
+            _uncommittedSize -= size;
+        }
     }
 
     private void StepLeader(Message message)
@@ -88,8 +138,10 @@ public sealed partial class RaftCore
             toAppend.Add(candidate);
         }
 
-        AppendEntries(toAppend);
-        BcastAppend();
+        if (AppendEntries(toAppend))
+        {
+            BcastAppend();
+        }
     }
 
     private void BcastAppend()
@@ -172,7 +224,7 @@ public sealed partial class RaftCore
                 case ProgressState.Replicate:
                     ulong last = entries[entries.Count - 1].Index;
                     progress.NextIndex = last + 1;
-                    progress.Inflights.Add(last);
+                    progress.Inflights.Add(last, PayloadsSize(entries));
                     break;
                 case ProgressState.Probe:
                     progress.ProbeSent = true;
@@ -181,6 +233,17 @@ public sealed partial class RaftCore
         }
 
         Send(message);
+    }
+
+    private static ulong PayloadsSize(IReadOnlyList<Entry> entries)
+    {
+        ulong total = 0;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            total += (ulong)entries[i].Data.Length;
+        }
+
+        return total;
     }
 
     private void SendSnapshot(ulong to, Raft.Progress.Progress progress)

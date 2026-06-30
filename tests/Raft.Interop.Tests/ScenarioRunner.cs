@@ -18,7 +18,11 @@ internal sealed class ScenarioRunner
     private readonly Dictionary<ulong, Node> _nodes = new();
     private readonly List<HashSet<ulong>> _partitions = new();
 
-    private ScenarioRunner(IReadOnlyList<ulong> ids, IReadOnlyDictionary<ulong, int> electionTicks, int heartbeatTicks)
+    private ScenarioRunner(
+        IReadOnlyList<ulong> ids,
+        IReadOnlyDictionary<ulong, int> electionTicks,
+        int heartbeatTicks,
+        bool checkQuorum)
     {
         var confState = new ConfState(ids);
         foreach (ulong id in ids)
@@ -30,6 +34,7 @@ internal sealed class ScenarioRunner
                 ElectionTick = electionTicks[id],
                 HeartbeatTick = heartbeatTicks,
                 RandomizedElectionTimeout = electionTicks[id],
+                CheckQuorum = checkQuorum,
             };
             _nodes[id] = new Node(new RaftCore(config, storage), storage, confState);
         }
@@ -53,7 +58,8 @@ internal sealed class ScenarioRunner
         }
 
         int heartbeatTicks = root.GetProperty("heartbeat_ticks").GetInt32();
-        var runner = new ScenarioRunner(ids, electionTicks, heartbeatTicks);
+        bool checkQuorum = root.TryGetProperty("check_quorum", out JsonElement cq) && cq.GetBoolean();
+        var runner = new ScenarioRunner(ids, electionTicks, heartbeatTicks, checkQuorum);
 
         foreach (JsonElement step in root.GetProperty("steps").EnumerateArray())
         {
@@ -246,12 +252,20 @@ internal sealed class ScenarioRunner
     {
         ulong leader = 0;
         ulong term = 0;
-        foreach (KeyValuePair<ulong, Node> node in _nodes)
+        foreach (ulong id in SortedIds())
         {
-            if (node.Value.Core.Role == RaftRole.Leader && node.Value.Core.Term >= term)
+            // Mirror the Rust harness: the term is the highest across all nodes (not just a leader's), so a leaderless
+            // outcome (e.g. a check-quorum step-down) still reports the surviving term.
+            ulong nodeTerm = _nodes[id].Core.Term;
+            if (nodeTerm > term)
             {
-                term = node.Value.Core.Term;
-                leader = node.Key;
+                term = nodeTerm;
+            }
+
+            if (_nodes[id].Core.Role == RaftRole.Leader && (leader == 0 || nodeTerm >= term))
+            {
+                term = nodeTerm;
+                leader = id;
             }
         }
 

@@ -10,7 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Raft.Transport\Raft.Transport.csproj" AdditionalProperties="NoWarn=CA1510;CA1512;CA1513;CA1716;CS1574" />
+    <ProjectReference Include="..\Raft.Transport\Raft.Transport.csproj" />
     <PackageReference Include="NanoMsgSharp" />
   </ItemGroup>
 

@@ -39,4 +39,10 @@ Numbers below are machine-specific and from a `--job Short` run, so timings carr
 
 Drives a single-node `RaftCore` through 1000 propose → append → commit → apply cycles (≈0.76 µs per command).
 
+## Other suites
+
+The project also includes `AsyncStorageWriteBenchmarks` (propose/commit driven through the asynchronous
+storage-writes path with `TakeStorageWrite`/`AckStorageWrite`) and `FlowControlBenchmarks` (the byte-windowed
+`Inflights` add/free cycle). Run a single suite with `--filter '*AsyncStorageWrite*'`.
+
 CI runs the same suite as a `--job Dry` smoke (build + execute once) so it never gates on timings.
