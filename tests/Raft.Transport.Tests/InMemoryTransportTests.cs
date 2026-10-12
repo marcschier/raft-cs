@@ -1,5 +1,7 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
+using System.Collections.Concurrent;
+
 namespace Raft.Transport.Tests;
 
 public sealed class InMemoryTransportTests
@@ -29,7 +31,7 @@ public sealed class InMemoryTransportTests
         IRaftTransport node2 = network.CreateNode(2);
         IRaftTransport node3 = network.CreateNode(3);
         IRaftTransport node4 = network.CreateNode(4);
-        List<byte[]> received = [];
+        ConcurrentBag<byte[]> received = [];
         node2.FrameReceived += frame => received.Add(frame.ToArray());
         node3.FrameReceived += frame => received.Add(frame.ToArray());
         node4.FrameReceived += frame => received.Add(frame.ToArray());

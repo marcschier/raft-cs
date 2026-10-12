@@ -83,6 +83,8 @@ BCL dependencies, analyzers, test tooling, CI actions, and Rust harness dependen
 target frameworks, strong-name identity, and the stable version suffix remain unchanged.
 Package metadata now identifies this repository. Releases publish all four packages to GitHub
 Packages only after every CI gate passes, then promote those same packages to nuget.org.
+The broadcast test collects concurrent peer callbacks in a thread-safe collection; production
+delivery behavior and all delivery assertions remain unchanged.
 
 ## 🧪 Samples & Interop
 
