@@ -59,8 +59,8 @@
     <Company>marcschier</Company>
     <Product>Raft</Product>
     <Copyright>Copyright (c) marcschier</Copyright>
-    <PackageProjectUrl>https://github.com/marcschier/crdt</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/marcschier/crdt</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/marcschier/raft-cs</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/marcschier/raft-cs</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>

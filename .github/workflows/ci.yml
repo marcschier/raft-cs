@@ -24,11 +24,11 @@ jobs:
       matrix:
         os: [ ubuntu-latest, windows-latest, macos-latest ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: |
             8.0.x
@@ -51,7 +51,7 @@ jobs:
         run: ./eng/check-line-length.ps1
 
       - name: Test
-        run: dotnet test Raft.slnx -c Release --no-build
+        run: dotnet test --solution Raft.slnx -c Release --no-build
 
   aot-test:
     name: aot test (${{ matrix.os }})
@@ -67,11 +67,11 @@ jobs:
           - os: macos-latest
             rid: osx-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: |
             8.0.x
@@ -98,11 +98,11 @@ jobs:
     name: coverage gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: |
             8.0.x
@@ -111,25 +111,26 @@ jobs:
 
       - name: Test with coverage
         run: >
-          dotnet test tests/Raft.Tests/Raft.Tests.csproj -c Release -f net10.0
+          dotnet test --project tests/Raft.Tests/Raft.Tests.csproj -c Release -f net10.0
+          --results-directory artifacts/coverage
           --coverage --coverage-output-format cobertura --coverage-output coverage.cobertura.xml
 
       - name: Enforce coverage threshold (>= 85% lines)
         shell: pwsh
         run: >
           ./eng/check-coverage.ps1
-          -CoverageFile tests/Raft.Tests/bin/Release/net10.0/TestResults/coverage.cobertura.xml
+          -CoverageFile artifacts/coverage/coverage.cobertura.xml
           -MinLineRate 0.85
 
   interop:
     name: interop (raft-rs behavioral parity)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: |
             8.0.x
@@ -141,24 +142,26 @@ jobs:
 
       - name: Build raft-rs harness
         working-directory: interop/raft-rs-harness
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Regenerate golden traces
         working-directory: interop/raft-rs-harness
-        run: cargo run --release -- self-test
+        run: >
+          cargo run --release --locked -- self-test &&
+          git -C ../.. diff --exit-code -- interop/scenarios
 
       - name: Behavioral-parity tests
-        run: dotnet test tests/Raft.Interop.Tests/Raft.Interop.Tests.csproj -c Release
+        run: dotnet test --project tests/Raft.Interop.Tests/Raft.Interop.Tests.csproj -c Release
 
   benchmarks:
     name: benchmark smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: |
             8.0.x
@@ -172,18 +175,18 @@ jobs:
 
   publish-github:
     name: publish to GitHub Packages
-    needs: [ build-test, aot-test, coverage, interop ]
+    needs: [ build-test, aot-test, coverage, interop, benchmarks ]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0   # Nerdbank.GitVersioning needs full history + tags
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: |
             8.0.x
@@ -205,4 +208,3 @@ jobs:
           dotnet nuget push "artifacts/*.nupkg"
           --source https://nuget.pkg.github.com/marcschier/index.json
           --api-key ${{ secrets.GITHUB_TOKEN }}
-          --skip-duplicate
