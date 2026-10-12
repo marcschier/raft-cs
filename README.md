@@ -65,7 +65,7 @@ See [`samples/Raft.Samples`](samples/Raft.Samples) for a runnable three-node dem
 
 ```shell
 dotnet build Raft.slnx -c Release
-dotnet test Raft.slnx -c Release
+dotnet test --solution Raft.slnx -c Release
 ```
 
 ## 📚 Documentation
@@ -75,6 +75,14 @@ dotnet test Raft.slnx -c Release
 - [Architecture](docs/architecture.md)
 - [Wire format](docs/wire-format.md)
 - [API reference](docs/api.md)
+
+## Release 1.1.3
+
+Updates the NanoMsg transport to NanoMsgSharp 1.1.3 and refreshes the .NET 10 servicing SDK,
+BCL dependencies, analyzers, test tooling, CI actions, and Rust harness dependencies. Public APIs,
+target frameworks, strong-name identity, and the stable version suffix remain unchanged.
+Package metadata now identifies this repository. Releases publish all four packages to GitHub
+Packages only after every CI gate passes, then promote those same packages to nuget.org.
 
 ## 🧪 Samples & Interop
 

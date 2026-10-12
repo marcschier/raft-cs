@@ -28,7 +28,7 @@ jobs:
       packages: read    # Read the packages from the GitHub Packages feed
     steps:
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: '10.0.x'
 
@@ -64,7 +64,7 @@ jobs:
 
       - name: NuGet login (OIDC trusted publishing)
         id: login
-        uses: NuGet/login@v1
+        uses: NuGet/login@v1.2.0
         with:
           user: ${{ secrets.NUGET_USER }}
 
@@ -73,4 +73,3 @@ jobs:
           dotnet nuget push "./download/*.nupkg"
           --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
           --source https://api.nuget.org/v3/index.json
-          --skip-duplicate
