@@ -21,7 +21,8 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly RaftNodeOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly Channel<object> _inbox;
-    private readonly Channel<ReadOnlyMemory<byte>> _committed;
+    private readonly Channel<CommittedItem> _committed;
+    private readonly CommittedPayloadReader _committedPayloads;
     private readonly Channel<RaftStateChange> _stateChanges;
     private readonly Channel<ConfState> _confChanges;
     private readonly CancellationTokenSource _stop = new();
@@ -75,11 +76,12 @@ public sealed class RaftNode : IAsyncDisposable
             SingleReader = true,
             SingleWriter = false,
         });
-        _committed = Channel.CreateUnbounded<ReadOnlyMemory<byte>>(new UnboundedChannelOptions
+        _committed = Channel.CreateUnbounded<CommittedItem>(new UnboundedChannelOptions
         {
             SingleReader = false,
             SingleWriter = true,
         });
+        _committedPayloads = new CommittedPayloadReader(_committed.Reader);
 
         int capacity = _options.StateObservationCapacity;
         if (capacity <= 0)
@@ -114,7 +116,11 @@ public sealed class RaftNode : IAsyncDisposable
     /// <summary>Gets this node's highest committed index.</summary>
     public ulong CommitIndex => (ulong)Interlocked.Read(ref _commitIndex);
 
-    /// <summary>Gets the highest log index applied and delivered through <see cref="Committed"/>.</summary>
+    /// <summary>
+    /// Gets the highest log index the node has applied: the commands up to it are queued on
+    /// <see cref="CommittedItems"/>, not necessarily processed by the consumer yet. A state machine takes its own
+    /// position from <see cref="CommittedItem.Index"/>.
+    /// </summary>
     public ulong AppliedIndex => (ulong)Interlocked.Read(ref _appliedIndex);
 
     /// <summary>Gets the current role.</summary>
@@ -123,8 +129,19 @@ public sealed class RaftNode : IAsyncDisposable
     /// <summary>Gets a value indicating whether this node currently believes itself to be the leader.</summary>
     public bool IsLeader => Role == RaftRole.Leader;
 
-    /// <summary>Gets a reader over committed application command payloads, in log order.</summary>
-    public ChannelReader<ReadOnlyMemory<byte>> Committed => _committed.Reader;
+    /// <summary>
+    /// Gets a reader over committed application command payloads, in log order. This is a view of
+    /// <see cref="CommittedItems"/> without the log positions: both read the same queue, so a consumer reads one of
+    /// them.
+    /// </summary>
+    public ChannelReader<ReadOnlyMemory<byte>> Committed => _committedPayloads;
+
+    /// <summary>
+    /// Gets a reader over committed application commands, in log order, each with its log index and term. The index of
+    /// the last item a state machine has applied is the log position its state corresponds to. This reads the same
+    /// queue as <see cref="Committed"/>, so a consumer reads one of them.
+    /// </summary>
+    public ChannelReader<CommittedItem> CommittedItems => _committed.Reader;
 
     /// <summary>
     /// Gets a reader over leadership/role transitions. The current state is emitted as the first item; thereafter a
@@ -488,7 +505,8 @@ public sealed class RaftNode : IAsyncDisposable
             case EntryType.Normal:
                 if (!entry.IsEmpty)
                 {
-                    _committed.Writer.TryWrite(entry.Data);
+                    _committed.Writer.TryWrite(
+                        new CommittedItem(CommittedItemKind.Command, entry.Index, entry.Term, entry.Data));
                 }
 
                 break;
