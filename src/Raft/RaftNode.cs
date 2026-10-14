@@ -457,13 +457,28 @@ public sealed class RaftNode : IAsyncDisposable
         }
 
         ulong appliedTo = 0;
+        List<CommittedItem>? commands = null;
         foreach (Entry entry in toApply)
         {
-            ApplyEntry(entry);
+            if (ApplyEntry(entry) is { } command)
+            {
+                (commands ??= new List<CommittedItem>(toApply.Count)).Add(command);
+            }
+
             appliedTo = entry.Index;
         }
 
         _core.AppliedTo(appliedTo);
+
+        // AppliedIndex covers every item before a consumer can read it, so the consumer may compact at that index.
+        Interlocked.Exchange(ref _appliedIndex, (long)_core.Applied);
+        if (commands is not null)
+        {
+            foreach (CommittedItem command in commands)
+            {
+                _committed.Writer.TryWrite(command);
+            }
+        }
 
         if (_core.ShouldAutoLeaveJoint())
         {
@@ -498,15 +513,15 @@ public sealed class RaftNode : IAsyncDisposable
         }
     }
 
-    private void ApplyEntry(Entry entry)
+    /// <summary>Applies one committed entry; returns the item to queue for a non-empty command.</summary>
+    private CommittedItem? ApplyEntry(Entry entry)
     {
         switch (entry.Type)
         {
             case EntryType.Normal:
                 if (!entry.IsEmpty)
                 {
-                    _committed.Writer.TryWrite(
-                        new CommittedItem(CommittedItemKind.Command, entry.Index, entry.Term, entry.Data));
+                    return new CommittedItem(CommittedItemKind.Command, entry.Index, entry.Term, entry.Data);
                 }
 
                 break;
@@ -524,6 +539,8 @@ public sealed class RaftNode : IAsyncDisposable
                 _confChanges.Writer.TryWrite(next);
                 break;
         }
+
+        return null;
     }
 
     private async ValueTask SendBatchAsync(IReadOnlyList<Message> messages, CancellationToken cancellationToken)

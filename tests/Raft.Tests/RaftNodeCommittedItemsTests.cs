@@ -77,6 +77,50 @@ public sealed class RaftNodeCommittedItemsTests
     }
 
     [Test]
+    public async Task AppliedIndex_CoversEveryItemAConsumerHasRead()
+    {
+        await using var network = new InMemoryNetwork();
+        RaftNode node = CreateSingleNode(network);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await StartLeaderAsync(node, timeout.Token);
+            const int count = 2000;
+            Task reader = Task.Run(
+                async () =>
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        CommittedItem item = await node.CommittedItems.ReadAsync(timeout.Token);
+
+                        // A consumer may snapshot or compact at the index it read, so it must be applied.
+                        if (node.AppliedIndex < item.Index)
+                        {
+                            throw new InvalidOperationException(
+                                $"Item {item.Index} was read while AppliedIndex was {node.AppliedIndex}.");
+                        }
+                    }
+                },
+                timeout.Token);
+
+            for (int i = 0; i < count; i++)
+            {
+                await node.ProposeAsync(new byte[] { (byte)i });
+                if (i % 16 == 0)
+                {
+                    await Task.Yield();
+                }
+            }
+
+            await reader;
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task CommittedItems_GiveEveryReplicaTheSameIndex()
     {
         ulong[] ids = { 1, 2, 3 };
