@@ -93,6 +93,107 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task Compact_ShrinksTheLogFile_AndReopensToTheSameState()
+    {
+        string directory = CreateDirectory();
+        string logPath = Path.Combine(directory, "log");
+        try
+        {
+            var hardState = new HardState(7, 2, 150);
+            long sizeBefore;
+            long sizeAfter;
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 200, payloadLength: 256));
+                storage.SetHardState(hardState);
+                sizeBefore = new FileInfo(logPath).Length;
+
+                storage.Compact(150);
+                sizeAfter = new FileInfo(logPath).Length;
+
+                // The appends after a compaction go to the compacted file.
+                storage.Append(CreateEntries(201, 5, payloadLength: 256));
+            }
+
+            // 50 of 200 entries remain, so the file holds about a quarter of its former size.
+            await Assert.That(sizeAfter).IsLessThan(sizeBefore / 3);
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(151UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(205UL);
+            await Assert.That(reopened.Term(150)).IsEqualTo(150UL);
+            await Assert.That(reopened.InitialState().HardState).IsEqualTo(hardState);
+            await AssertEntriesEqual(
+                reopened.Entries(151, 206, ulong.MaxValue),
+                CreateEntries(151, 55, payloadLength: 256));
+            await AssertStorageError(() => reopened.Entries(150, 151, ulong.MaxValue), RaftStorageError.Compacted);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Compact_KeepsTheLogFileBoundedOverManyRounds()
+    {
+        string directory = CreateDirectory();
+        string logPath = Path.Combine(directory, "log");
+        try
+        {
+            var sizes = new List<long>();
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                for (int round = 0; round < 10; round++)
+                {
+                    ulong start = storage.LastIndex() + 1;
+                    storage.Append(CreateEntries(start, 100, payloadLength: 64));
+                    storage.SetHardState(new HardState(1, 1, storage.LastIndex()));
+                    storage.Compact(storage.LastIndex() - 10);
+                    sizes.Add(new FileInfo(logPath).Length);
+                }
+            }
+
+            // Every round retains the same ten entries' worth of log, so the file does not grow.
+            await Assert.That(sizes.Max()).IsEqualTo(sizes.Min());
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(991UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(1000UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Reopen_DiscardsAnInterruptedCompaction()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 5));
+            }
+
+            // A crash while the compacted log was being written leaves a partial file next to the intact log.
+            string compactingPath = Path.Combine(directory, "log.compact");
+            System.IO.File.WriteAllBytes(compactingPath, new byte[] { 0, 0, 0, 9, 4, 1 });
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(System.IO.File.Exists(compactingPath)).IsFalse();
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(1UL);
+            await AssertEntriesEqual(reopened.Entries(1, 6, ulong.MaxValue), CreateEntries(1, 5));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task ApplySnapshot_InstallsBoundaryAndMatchesMemoryStorage()
     {
         string directory = CreateDirectory();
@@ -285,13 +386,15 @@ public sealed class FileRaftStorageTests
         }
     }
 
-    private static Entry[] CreateEntries(ulong start, int count)
+    private static Entry[] CreateEntries(ulong start, int count, int payloadLength = 1)
     {
         var entries = new Entry[count];
         for (int i = 0; i < count; i++)
         {
             ulong index = start + (ulong)i;
-            entries[i] = new Entry(EntryType.Normal, index, index, new[] { (byte)index });
+            byte[] payload = new byte[payloadLength];
+            payload.AsSpan().Fill((byte)index);
+            entries[i] = new Entry(EntryType.Normal, index, index, payload);
         }
 
         return entries;

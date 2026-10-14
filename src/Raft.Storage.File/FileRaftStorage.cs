@@ -9,23 +9,28 @@ namespace Raft.Storage.File;
 public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 {
     private const string LogFileName = "log";
+    private const string CompactingLogFileName = "log.compact";
     private const string HardStateFileName = "hardstate";
     private const string SnapshotFileName = "snapshot";
     private const byte EntryRecord = 0;
     private const byte TruncateRecord = 1;
     private const byte CompactRecord = 2;
     private const byte HardStateRecord = 3;
+    private const byte BaseRecord = 4;
     private const int LengthPrefixSize = 4;
     private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
     private const int HardStateRecordSize = 1 + (3 * 8);
+    private const int BaseRecordSize = 1 + (2 * 8);
     private const int UInt64Size = 8;
 
     private readonly object _gate = new();
+    private readonly string _logPath;
+    private readonly string _compactingLogPath;
     private readonly string _hardStatePath;
     private readonly string _snapshotPath;
     private readonly bool _fsync;
     private readonly List<Entry> _entries = new() { default };
-    private readonly FileStream _logStream;
+    private FileStream _logStream;
     private HardState _hardState;
     private Snapshot _snapshot = new(new SnapshotMetadata(0, 0, new ConfState()), ReadOnlyMemory<byte>.Empty);
     private bool _disposed;
@@ -38,15 +43,19 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 
         Directory.CreateDirectory(options.DirectoryPath);
         _fsync = options.Fsync;
-        string logPath = Path.Combine(options.DirectoryPath, LogFileName);
+        _logPath = Path.Combine(options.DirectoryPath, LogFileName);
+        _compactingLogPath = Path.Combine(options.DirectoryPath, CompactingLogFileName);
         _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
         _snapshotPath = Path.Combine(options.DirectoryPath, SnapshotFileName);
 
+        // A compacted log that was still being written when the process stopped is incomplete; the log it was to
+        // replace is intact.
+        System.IO.File.Delete(_compactingLogPath);
+
         LoadSnapshot();
         LoadHardState();
-        ReplayLog(logPath);
-        _logStream = new FileStream(logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        _logStream.Seek(0, SeekOrigin.End);
+        ReplayLog(_logPath);
+        _logStream = OpenLog();
     }
 
     /// <inheritdoc/>
@@ -274,7 +283,11 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         FlushLog();
     }
 
-    /// <summary>Compacts the in-memory log up to (and excluding) <paramref name="compactIndex"/>.</summary>
+    /// <summary>
+    /// Compacts the log up to (and excluding) <paramref name="compactIndex"/> and rewrites the log file so it holds
+    /// only the retained entries. The compacted log is written next to the log and then replaces it, so after a crash
+    /// either the former or the compacted log is in place, and both describe the retained entries.
+    /// </summary>
     /// <param name="compactIndex">The first index to retain.</param>
     public void Compact(ulong compactIndex)
     {
@@ -282,9 +295,8 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         {
             ThrowIfDisposed();
             Entry boundary = CompactCore(compactIndex);
-            WriteCompactRecord(compactIndex);
-            FlushLog();
             _entries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
+            RewriteLog();
         }
     }
 
@@ -550,6 +562,22 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 }
 
                 break;
+            case BaseRecord:
+                if (payload.Length == BaseRecordSize)
+                {
+                    int offset = 1;
+                    ulong index = ReadUInt64(payload, ref offset);
+                    ulong term = ReadUInt64(payload, ref offset);
+
+                    // A newer snapshot already covers a base at or below its index.
+                    if (index > _entries[0].Index)
+                    {
+                        _entries.Clear();
+                        _entries.Add(new Entry(EntryType.Normal, term, index, default));
+                    }
+                }
+
+                break;
             case CompactRecord:
                 if (payload.Length == 1 + UInt64Size)
                 {
@@ -600,19 +628,22 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         payload[0] = TruncateRecord;
         int offset = 1;
         WriteUInt64(payload, ref offset, index);
-        WriteRecord(payload);
+        WriteRecord(_logStream, payload);
     }
 
-    private void WriteCompactRecord(ulong index)
+    private static void WriteBaseRecord(Stream stream, Entry boundary)
     {
-        Span<byte> payload = stackalloc byte[1 + UInt64Size];
-        payload[0] = CompactRecord;
+        Span<byte> payload = stackalloc byte[BaseRecordSize];
+        payload[0] = BaseRecord;
         int offset = 1;
-        WriteUInt64(payload, ref offset, index);
-        WriteRecord(payload);
+        WriteUInt64(payload, ref offset, boundary.Index);
+        WriteUInt64(payload, ref offset, boundary.Term);
+        WriteRecord(stream, payload);
     }
 
-    private void WriteHardStateRecord(HardState hardState)
+    private void WriteHardStateRecord(HardState hardState) => WriteHardStateRecord(_logStream, hardState);
+
+    private static void WriteHardStateRecord(Stream stream, HardState hardState)
     {
         Span<byte> payload = stackalloc byte[HardStateRecordSize];
         payload[0] = HardStateRecord;
@@ -620,10 +651,12 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         WriteUInt64(payload, ref offset, hardState.Term);
         WriteUInt64(payload, ref offset, hardState.Vote);
         WriteUInt64(payload, ref offset, hardState.Commit);
-        WriteRecord(payload);
+        WriteRecord(stream, payload);
     }
 
-    private void WriteEntryRecord(Entry entry)
+    private void WriteEntryRecord(Entry entry) => WriteEntryRecord(_logStream, entry);
+
+    private static void WriteEntryRecord(Stream stream, Entry entry)
     {
         int length = EntryHeaderSize + entry.Data.Length;
         byte[] payload = new byte[length];
@@ -635,15 +668,15 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(offset), entry.Data.Length);
         offset += 4;
         entry.Data.Span.CopyTo(payload.AsSpan(offset));
-        WriteRecord(payload);
+        WriteRecord(stream, payload);
     }
 
-    private void WriteRecord(ReadOnlySpan<byte> payload)
+    private static void WriteRecord(Stream stream, ReadOnlySpan<byte> payload)
     {
         Span<byte> lengthBuffer = stackalloc byte[LengthPrefixSize];
         BinaryPrimitives.WriteInt32BigEndian(lengthBuffer, payload.Length);
-        Write(_logStream, lengthBuffer);
-        Write(_logStream, payload);
+        Write(stream, lengthBuffer);
+        Write(stream, payload);
     }
 
     private static void Write(Stream stream, ReadOnlySpan<byte> buffer)
@@ -655,6 +688,44 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private void FlushLog()
     {
         _logStream.Flush(_fsync);
+    }
+
+    private FileStream OpenLog()
+    {
+        var stream = new FileStream(_logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        stream.Seek(0, SeekOrigin.End);
+        return stream;
+    }
+
+    /// <summary>
+    /// Replaces the log file with one that holds only the retained log: the compaction boundary, the entries after it,
+    /// and the hard state.
+    /// </summary>
+    private void RewriteLog()
+    {
+        using (var compacted = new FileStream(
+            _compactingLogPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            WriteBaseRecord(compacted, _entries[0]);
+            for (int i = 1; i < _entries.Count; i++)
+            {
+                WriteEntryRecord(compacted, _entries[i]);
+            }
+
+            WriteHardStateRecord(compacted, _hardState);
+            compacted.Flush(_fsync);
+        }
+
+        // The log is closed while it is replaced, and reopened whether or not the replacement succeeded.
+        _logStream.Dispose();
+        try
+        {
+            System.IO.File.Replace(_compactingLogPath, _logPath, destinationBackupFileName: null);
+        }
+        finally
+        {
+            _logStream = OpenLog();
+        }
     }
 
     private void ResetLogFile()
