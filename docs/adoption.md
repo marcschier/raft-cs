@@ -10,32 +10,31 @@ A `RaftNode` is one replica. It owns a deterministic consensus core, a durable `
 
 A state machine is just a fold over the committed command stream. Three rules make it correct across restarts:
 
-1. **Apply in order, from `Committed`.** Never apply a command before it appears on `Committed`.
+1. **Apply in order, from `CommittedItems`** (or `Committed`). Never apply a command before it appears there.
 2. **Track the applied index durably**, alongside your state. On restart you must not re-apply commands you already applied (the log replays from the last snapshot/compaction point, which may be behind your state machine).
 3. **Make apply idempotent or index-guarded**, because after a crash you may see a command you already applied.
 
-`RaftNode` does not tag each committed payload with its log index (the `Committed` stream is raw bytes). The simplest robust pattern is to make the **index part of your command** (or derive your applied index from your own state) so you can skip already-applied commands:
+`CommittedItems` delivers each committed command with its log index (`CommittedItem.Index`) and term, so the index of the last item you applied is the log position your state corresponds to. Guard with it to skip already-applied commands:
 
 ```csharp
-long applied = LoadAppliedIndexFromMyStore(); // durable, next to your state
+ulong applied = LoadAppliedIndexFromMyStore(); // durable, next to your state
 
-await foreach (ReadOnlyMemory<byte> payload in node.Committed.ReadAllAsync(ct))
+await foreach (CommittedItem item in node.CommittedItems.ReadAllAsync(ct))
 {
-    Command command = Decode(payload.Span);
-    if (command.Index <= applied)
+    if (item.Index <= applied)
     {
         continue; // already applied before the crash
     }
 
-    ApplyToMyState(command);          // mutate your state machine
-    applied = command.Index;
+    ApplyToMyState(item.Data.Span);   // mutate your state machine
+    applied = item.Index;
     PersistMyStateAndAppliedIndex();  // durably, together
 }
 ```
 
-If you do not want to stamp indices into commands, you can instead consume `Committed` and persist your applied state and a monotonically increasing counter together, treating the counter as your applied watermark.
+`Committed` is the same stream without the positions (only the payloads); both read one queue, so consume one of them.
 
-The node's own watermarks are available for coordination: `node.CommitIndex` (committed) and `node.AppliedIndex` (the highest index the node has surfaced through `Committed`).
+The node's own watermarks are available for coordination: `node.CommitIndex` (committed) and `node.AppliedIndex` (the highest index the node has applied and queued on `CommittedItems`, which your consumer may not have processed yet).
 
 ## Bootstrapping and restarting
 
