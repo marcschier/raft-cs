@@ -88,14 +88,15 @@ The current values are also available synchronously: `node.IsLeader`, `node.Lead
 
 ## Bound the log (compaction)
 
-The log grows with every committed command. Once your state machine has durably applied entries up to some index, discard the prefix so the on-disk log stays bounded:
+The log grows with every committed command. Snapshot your state machine at the index of the last item it applied, then discard the log up to that index so the on-disk log stays bounded:
 
 ```csharp
-// After persisting your state-machine state covering everything up to node.AppliedIndex:
-await node.CompactAsync(node.AppliedIndex);
+// appliedIndex is the CommittedItem.Index of the last item your state machine applied.
+await node.CreateSnapshotAsync(appliedIndex, SerializeMyState());
+await node.CompactAsync(appliedIndex);
 ```
 
-`CompactAsync` runs on the node's driver loop, so it is safe to call from any thread. A follower that falls behind the compacted boundary is re-seeded with a snapshot automatically — see [Snapshots and compaction](adoption.md#snapshots-and-log-compaction) for how to make snapshots carry your application state.
+Both run on the node's driver loop, so they are safe to call from any thread. A follower that falls behind the compacted boundary receives the snapshot, and its `CommittedItems` stream hands it to the state machine — see [Snapshots and compaction](adoption.md#snapshots-and-log-compaction).
 
 ## Persist across restarts
 

@@ -8,12 +8,13 @@ namespace Raft.Storage;
 /// A volatile, thread-safe <see cref="IRaftStorage"/> kept entirely in memory. It mirrors the raft-rs
 /// <c>MemStorage</c>: a sentinel entry at index 0 of the buffer represents the compacted snapshot boundary.
 /// </summary>
-public sealed class MemoryStorage : IRaftWritableStorage
+public sealed class MemoryStorage : IRaftSnapshotStorage
 {
     private readonly object _gate = new();
     private readonly List<Entry> _entries = new() { default };
     private HardState _hardState;
     private SnapshotMetadata _snapshotMetadata;
+    private Snapshot? _snapshot;
 
     /// <summary>Initializes a new instance of the <see cref="MemoryStorage"/> class with no initial members.</summary>
     public MemoryStorage()
@@ -144,6 +145,11 @@ public sealed class MemoryStorage : IRaftWritableStorage
     {
         lock (_gate)
         {
+            if (_snapshot is not null && requestIndex <= _snapshot.Metadata.Index)
+            {
+                return _snapshot;
+            }
+
             ulong appliedIndex = _hardState.Commit;
             if (requestIndex > appliedIndex)
             {
@@ -206,12 +212,51 @@ public sealed class MemoryStorage : IRaftWritableStorage
             }
 
             _snapshotMetadata = snapshot.Metadata;
+            _snapshot = snapshot;
             _entries.Clear();
             _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));
             _hardState = new HardState(
                 Math.Max(_hardState.Term, snapshot.Metadata.Term),
                 _hardState.Vote,
                 index);
+        }
+    }
+
+    /// <inheritdoc/>
+    public Snapshot CreateSnapshot(ulong index, ConfState confState, ReadOnlyMemory<byte> data)
+    {
+        Internal.Check.NotNull(confState);
+
+        lock (_gate)
+        {
+            if (_snapshot is not null && index <= _snapshot.Metadata.Index)
+            {
+                throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
+            }
+
+            ulong offset = _entries[0].Index;
+            if (index < offset)
+            {
+                throw new RaftStorageException(RaftStorageError.Compacted);
+            }
+
+            if (index > LastIndexLocked())
+            {
+                throw new RaftStorageException(RaftStorageError.Unavailable);
+            }
+
+            ulong term = _entries[(int)(index - offset)].Term;
+            _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), data.ToArray());
+            return _snapshot;
+        }
+    }
+
+    /// <inheritdoc/>
+    public Snapshot? LatestSnapshot()
+    {
+        lock (_gate)
+        {
+            return _snapshot;
         }
     }
 

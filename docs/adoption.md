@@ -86,21 +86,37 @@ Set `BindAddress` to `tcp://*:0` for an OS-assigned port and read it back from `
 
 Without compaction the log grows forever. Compaction discards the already-applied prefix; a follower that then falls behind the compacted boundary is caught up by an **install-snapshot** message instead of a log replay.
 
-**What the library does:** `RaftNode.CompactAsync(index)` discards the applied prefix on the driver loop (thread-safe), and the leader automatically sends a snapshot (produced by `IRaftStorage.Snapshot()`) to any follower whose next index falls below the compacted boundary. A follower installs that snapshot via `IRaftWritableStorage.ApplySnapshot`.
+The snapshot carries your *application* state, which only your code knows, so your state machine creates it and the node does the rest:
 
-**What you must provide:** the snapshot must carry your *application* state, and only your code knows that state. The built-in `MemoryStorage` and `FileRaftStorage` are **log stores** — their `Snapshot()` returns no application data, so they cannot bring a far-behind follower's state machine up to date. For production compaction you have two options:
+- **Create.** `RaftNode.CreateSnapshotAsync(index, data)` records your serialized state at `index` (the `CommittedItem.Index` of the last item you applied) in the storage, with the cluster membership at that index. The storage must implement `IRaftSnapshotStorage`; `MemoryStorage` and `FileRaftStorage` do.
+- **Compact.** `RaftNode.CompactAsync(index)` then discards the log up to `index` on the driver loop. It refuses to compact past the latest snapshot, because the snapshot and the log after it must together hold every applied command. `FileRaftStorage` rewrites its log file to the retained entries.
+- **Lagging followers.** The leader sends the latest snapshot to any follower whose next index falls below the compacted boundary. Once the follower has stored it, its `CommittedItems` stream delivers it as a `CommittedItemKind.Snapshot` item: replace your state with `item.Data`, then apply the commands after it.
+- **Restart.** When the storage holds a snapshot, `CommittedItems` starts with it, followed by the commands after it. A storage whose log was compacted past its latest snapshot is refused (`InvalidOperationException`), because the commands in between are lost.
 
-1. **Keep voters caught up before compacting** (e.g. compact only well behind the slowest follower's match index) so no follower ever needs a data-carrying snapshot. Simplest, works with the built-in stores.
-2. **Implement a snapshotting `IRaftStorage`** whose `Snapshot()` serializes your state machine and whose `ApplySnapshot()` restores it (the raft-rs/etcd model, where storage and state machine are integrated). This is the robust path for clusters where a follower can fall arbitrarily behind.
-
-A safe compaction loop:
+A compaction loop inside your state machine's apply loop:
 
 ```csharp
-// Periodically, after persisting your state machine up to node.AppliedIndex:
-await node.CompactAsync(node.AppliedIndex);
+await foreach (CommittedItem item in node.CommittedItems.ReadAllAsync(ct))
+{
+    if (item.Kind == CommittedItemKind.Snapshot)
+    {
+        RestoreMyState(item.Data.Span);   // replaces the whole state
+    }
+    else
+    {
+        ApplyToMyState(item.Data.Span);
+    }
+
+    if (++sinceSnapshot >= 1024)
+    {
+        await node.CreateSnapshotAsync(item.Index, SerializeMyState(), ct);
+        await node.CompactAsync(item.Index, ct);
+        sinceSnapshot = 0;
+    }
+}
 ```
 
-> Application-facing delivery of snapshot *data* through the node (so even a generic log store could hand a follower's state machine the bytes) is a planned enhancement; today it requires a snapshotting `IRaftStorage` as in option 2.
+With snapshots in the storage, the snapshot is the durable copy of your state, so you need not persist the state and applied index yourself: after a restart the node hands you the snapshot and replays the commands after it. `Committed` (payloads only) skips snapshot items; use `CommittedItems` when you compact.
 
 ## Operations
 

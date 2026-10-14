@@ -16,6 +16,7 @@ public sealed class RaftNode : IAsyncDisposable
 {
     private readonly RaftCore _core;
     private readonly IRaftWritableStorage _storage;
+    private readonly IRaftSnapshotStorage? _snapshotStorage;
     private readonly Raft.Transport.IRaftTransport _transport;
     private readonly Raft.Transport.IRaftBatchTransport? _batchTransport;
     private readonly RaftNodeOptions _options;
@@ -28,6 +29,10 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _startGate = new(1, 1);
     private readonly object _tickSignal = new();
+
+    // The committed configurations since the latest snapshot, keyed by the index of the entry that committed them, so
+    // a snapshot records the membership at its own index.
+    private readonly List<KeyValuePair<ulong, ConfState>> _confHistory = new();
 
     private ConfState _confState;
     private volatile ConfState _publishedConfState;
@@ -64,13 +69,16 @@ public sealed class RaftNode : IAsyncDisposable
         Internal.Check.NotNull(transport);
 
         _storage = storage;
+        _snapshotStorage = storage as IRaftSnapshotStorage;
         _transport = transport;
         _batchTransport = transport as Raft.Transport.IRaftBatchTransport;
         _options = options ?? new RaftNodeOptions();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _core = new RaftCore(config, storage);
-        _appliedIndex = (long)_core.Applied;
         _confState = storage.InitialState().ConfState;
+        Snapshot? restored = RestoreLatestSnapshot();
+        _appliedIndex = (long)_core.Applied;
+        _confHistory.Add(new KeyValuePair<ulong, ConfState>(_core.Applied, _confState));
         _inbox = Channel.CreateUnbounded<object>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -82,6 +90,12 @@ public sealed class RaftNode : IAsyncDisposable
             SingleWriter = true,
         });
         _committedPayloads = new CommittedPayloadReader(_committed.Reader);
+
+        // The application restores the latest snapshot before the entries after it are applied.
+        if (restored is not null)
+        {
+            _committed.Writer.TryWrite(CommittedItem.ForSnapshot(restored));
+        }
 
         int capacity = _options.StateObservationCapacity;
         if (capacity <= 0)
@@ -131,15 +145,17 @@ public sealed class RaftNode : IAsyncDisposable
 
     /// <summary>
     /// Gets a reader over committed application command payloads, in log order. This is a view of
-    /// <see cref="CommittedItems"/> without the log positions: both read the same queue, so a consumer reads one of
-    /// them.
+    /// <see cref="CommittedItems"/> without the log positions and without snapshots: both read the same queue, so a
+    /// consumer reads one of them.
     /// </summary>
     public ChannelReader<ReadOnlyMemory<byte>> Committed => _committedPayloads;
 
     /// <summary>
-    /// Gets a reader over committed application commands, in log order, each with its log index and term. The index of
-    /// the last item a state machine has applied is the log position its state corresponds to. This reads the same
-    /// queue as <see cref="Committed"/>, so a consumer reads one of them.
+    /// Gets a reader over the apply stream, in log order: committed application commands, each with its log index and
+    /// term, and snapshots that replace the application state (<see cref="CommittedItemKind.Snapshot"/>). A snapshot
+    /// comes first after a restart when the storage holds one (<see cref="IRaftSnapshotStorage"/>), and when this node
+    /// installs a snapshot from the leader. The index of the last item a state machine has applied is the log position
+    /// its state corresponds to. This reads the same queue as <see cref="Committed"/>, so a consumer reads one of them.
     /// </summary>
     public ChannelReader<CommittedItem> CommittedItems => _committed.Reader;
 
@@ -248,15 +264,17 @@ public sealed class RaftNode : IAsyncDisposable
     /// <summary>
     /// Discards the applied log prefix up to (and excluding) <paramref name="index"/> to bound the on-disk log. The
     /// compaction runs on the driver loop, serialized with all other storage access. A follower whose next index falls
-    /// below the compacted boundary is automatically re-seeded with a snapshot, so for full state transfer to a
-    /// far-behind follower the <see cref="IRaftWritableStorage"/> must serialize/restore application state in its
-    /// <see cref="IRaftStorage.Snapshot"/>/<see cref="IRaftWritableStorage.ApplySnapshot"/> implementations (the
-    /// built-in stores carry no application state in snapshots).
+    /// below the compacted boundary is automatically re-seeded with the latest snapshot, so for full state transfer to
+    /// a far-behind follower the application records its state with <see cref="CreateSnapshotAsync"/> before it
+    /// compacts. When the storage holds a snapshot, the log is not compacted past it: the snapshot and the log after it
+    /// must together hold every applied entry, for a restart and for a lagging follower.
     /// </summary>
     /// <param name="index">The first index to retain; must not exceed <see cref="AppliedIndex"/>.</param>
     /// <param name="cancellationToken">A token that cancels the wait (the compaction itself still completes).</param>
     /// <returns>A task that completes when the log has been compacted.</returns>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is past the applied index.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="index"/> is past the applied index or past the latest snapshot.
+    /// </exception>
     public Task CompactAsync(ulong index, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -267,25 +285,58 @@ public sealed class RaftNode : IAsyncDisposable
                 nameof(index), index, $"Cannot compact past the applied index {applied}.");
         }
 
-        var request = new CompactRequest(index);
-        if (cancellationToken.CanBeCanceled)
+        // The latest snapshot only moves forward, so a compaction allowed here stays allowed on the loop.
+        if (_snapshotStorage?.LatestSnapshot() is { IsEmpty: false } latest && index > latest.Metadata.Index)
         {
-            CancellationTokenRegistration registration = cancellationToken.Register(
-                static state => ((CompactRequest)state!).Completion.TrySetCanceled(), request);
-            _ = request.Completion.Task.ContinueWith(
-                static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
-                registration,
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
+            throw new ArgumentOutOfRangeException(
+                nameof(index), index, $"Cannot compact past the latest snapshot at index {latest.Metadata.Index}.");
         }
 
-        if (!_inbox.Writer.TryWrite(request))
+        return EnqueueRequest(new CompactRequest(index), cancellationToken);
+    }
+
+    /// <summary>
+    /// Records a snapshot of the application state at <paramref name="index"/> in the storage, with the cluster
+    /// membership at that index. The leader sends the latest snapshot to a follower whose log ends before the compacted
+    /// boundary, and a node hands it to its application on <see cref="CommittedItems"/> after a restart. Afterwards,
+    /// <see cref="CompactAsync"/> may discard the log up to <paramref name="index"/>.
+    /// </summary>
+    /// <param name="index">
+    /// The log index the state corresponds to: the <see cref="CommittedItem.Index"/> of the last item the application
+    /// applied. Must not exceed <see cref="AppliedIndex"/>.
+    /// </param>
+    /// <param name="data">The application state; the node keeps its own copy.</param>
+    /// <param name="cancellationToken">A token that cancels the wait (the snapshot itself is still recorded).</param>
+    /// <returns>The metadata of the recorded snapshot.</returns>
+    /// <exception cref="NotSupportedException">
+    /// The storage does not implement <see cref="IRaftSnapshotStorage"/>.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="index"/> is zero or past the applied index.
+    /// </exception>
+    /// <exception cref="RaftStorageException">
+    /// The storage refused the snapshot, for example because it is not newer than the latest one.
+    /// </exception>
+    public Task<SnapshotMetadata> CreateSnapshotAsync(
+        ulong index,
+        ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (_snapshotStorage is null)
         {
-            request.Completion.TrySetException(new ObjectDisposedException(nameof(RaftNode)));
+            throw new NotSupportedException(
+                $"The storage of this node does not keep snapshots; it must implement {nameof(IRaftSnapshotStorage)}.");
         }
 
-        return request.Completion.Task;
+        ulong applied = AppliedIndex;
+        if (index == 0 || index > applied)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(index), index, $"A snapshot index must be between 1 and the applied index {applied}.");
+        }
+
+        return EnqueueRequest(new SnapshotRequest(index, data.ToArray()), cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -370,6 +421,10 @@ public sealed class RaftNode : IAsyncDisposable
                     {
                         HandleCompact(compact);
                     }
+                    else if (item is SnapshotRequest snapshot)
+                    {
+                        HandleCreateSnapshot(snapshot);
+                    }
                 }
 
                 await ProcessReadyAsync(cancellationToken).ConfigureAwait(false);
@@ -419,6 +474,12 @@ public sealed class RaftNode : IAsyncDisposable
     {
         _appendInFlight = false;
         StorageWrite write = complete.Write;
+
+        // A snapshot from the leader is durable now: it replaces the application state before any entry after it.
+        if (write.Snapshot is not null)
+        {
+            DeliverInstalledSnapshot(write.Snapshot);
+        }
 
         // Responses (follower append acknowledgements and granted votes) are released only now that the write is
         // durable, because a node must never acknowledge state it has not yet persisted.
@@ -513,6 +574,76 @@ public sealed class RaftNode : IAsyncDisposable
         }
     }
 
+    private void HandleCreateSnapshot(SnapshotRequest request)
+    {
+        try
+        {
+            Snapshot snapshot = _snapshotStorage!.CreateSnapshot(
+                request.Index, ConfStateAt(request.Index), request.Data);
+
+            // Only the configuration in force at the snapshot and the ones committed after it are still needed.
+            int keepFrom = _confHistory.FindLastIndex(pair => pair.Key <= request.Index);
+            if (keepFrom > 0)
+            {
+                _confHistory.RemoveRange(0, keepFrom);
+            }
+
+            request.Completion.TrySetResult(snapshot.Metadata);
+        }
+        catch (Exception ex)
+        {
+            request.Completion.TrySetException(ex);
+        }
+    }
+
+    private ConfState ConfStateAt(ulong index)
+    {
+        for (int i = _confHistory.Count - 1; i > 0; i--)
+        {
+            if (_confHistory[i].Key <= index)
+            {
+                return _confHistory[i].Value;
+            }
+        }
+
+        return _confHistory[0].Value;
+    }
+
+    /// <summary>
+    /// Validates the latest snapshot in the storage on start and marks the log applied up to it, so the application
+    /// restores the snapshot and then applies only the entries after it.
+    /// </summary>
+    private Snapshot? RestoreLatestSnapshot()
+    {
+        if (_snapshotStorage?.LatestSnapshot() is not { IsEmpty: false } snapshot)
+        {
+            return null;
+        }
+
+        ulong compacted = _storage.FirstIndex() - 1;
+        if (snapshot.Metadata.Index < compacted)
+        {
+            throw new InvalidOperationException(
+                $"The log is compacted to index {compacted}, past the latest snapshot at index "
+                + $"{snapshot.Metadata.Index}: the entries between them are in neither, so the application state "
+                + "cannot be restored.");
+        }
+
+        _core.RestoreAppliedTo(snapshot.Metadata.Index);
+        return snapshot;
+    }
+
+    private void DeliverInstalledSnapshot(Snapshot snapshot)
+    {
+        ConfState confState = snapshot.Metadata.ConfState;
+        _confHistory.Clear();
+        _confHistory.Add(new KeyValuePair<ulong, ConfState>(snapshot.Metadata.Index, confState));
+        _committed.Writer.TryWrite(CommittedItem.ForSnapshot(snapshot));
+
+        _publishedConfState = confState;
+        _confChanges.Writer.TryWrite(confState);
+    }
+
     /// <summary>Applies one committed entry; returns the item to queue for a non-empty command.</summary>
     private CommittedItem? ApplyEntry(Entry entry)
     {
@@ -531,6 +662,7 @@ public sealed class RaftNode : IAsyncDisposable
                 ConfChangeV2 change = ConfChangeV2.Decode(entry.Data.Span);
                 ConfState next = Changer.Apply(_confState, change);
                 _confState = next;
+                _confHistory.Add(new KeyValuePair<ulong, ConfState>(entry.Index, next));
                 _core.ApplyConfChange(next);
                 _storage.SetConfState(next);
 
@@ -672,17 +804,54 @@ public sealed class RaftNode : IAsyncDisposable
         internal StorageWrite Write { get; }
     }
 
-    /// <summary>Loop request to compact the log up to (and excluding) <see cref="Index"/>.</summary>
-    private sealed class CompactRequest
+    private Task<TResult> EnqueueRequest<TResult>(LoopRequest<TResult> request, CancellationToken cancellationToken)
     {
-        internal CompactRequest(ulong index)
+        if (cancellationToken.CanBeCanceled)
+        {
+            CancellationTokenRegistration registration = cancellationToken.Register(
+                static state => ((LoopRequest<TResult>)state!).Completion.TrySetCanceled(), request);
+            _ = request.Completion.Task.ContinueWith(
+                static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
+                registration,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        if (!_inbox.Writer.TryWrite(request))
+        {
+            request.Completion.TrySetException(new ObjectDisposedException(nameof(RaftNode)));
+        }
+
+        return request.Completion.Task;
+    }
+
+    /// <summary>A request the driver loop runs, serialized with all other storage access.</summary>
+    private abstract class LoopRequest<TResult>
+    {
+        internal TaskCompletionSource<TResult> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    /// <summary>Loop request to compact the log up to (and excluding) <see cref="Index"/>.</summary>
+    private sealed class CompactRequest : LoopRequest<bool>
+    {
+        internal CompactRequest(ulong index) => Index = index;
+
+        internal ulong Index { get; }
+    }
+
+    /// <summary>Loop request to record a snapshot of the application state at <see cref="Index"/>.</summary>
+    private sealed class SnapshotRequest : LoopRequest<SnapshotMetadata>
+    {
+        internal SnapshotRequest(ulong index, byte[] data)
         {
             Index = index;
-            Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Data = data;
         }
 
         internal ulong Index { get; }
 
-        internal TaskCompletionSource<bool> Completion { get; }
+        internal byte[] Data { get; }
     }
 }

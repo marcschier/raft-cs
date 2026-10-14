@@ -93,6 +93,97 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task CreateSnapshot_KeepsTheEntriesAfterIt_AndSurvivesReopen()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var confState = new Configuration.ConfState(TwoVoters);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 10));
+                storage.SetHardState(new HardState(10, 1, 10));
+
+                Snapshot created = storage.CreateSnapshot(6, confState, new byte[] { 1, 2, 3 });
+
+                await Assert.That(created.Metadata.Index).IsEqualTo(6UL);
+                await Assert.That(created.Metadata.Term).IsEqualTo(6UL);
+                await Assert.That(storage.LatestSnapshot()).IsSameReferenceAs(created);
+                await Assert.That(storage.Snapshot(0)).IsSameReferenceAs(created);
+                await AssertEntriesEqual(storage.Entries(7, 11, ulong.MaxValue), CreateEntries(7, 4));
+                await AssertStorageError(
+                    () => storage.CreateSnapshot(6, confState, new byte[] { 4 }),
+                    RaftStorageError.SnapshotOutOfDate);
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            Snapshot? latest = reopened.LatestSnapshot();
+            await Assert.That(latest).IsNotNull();
+            await Assert.That(latest!.Metadata.Index).IsEqualTo(6UL);
+            await Assert.That(latest.Metadata.Term).IsEqualTo(6UL);
+            await Assert.That(latest.Data.ToArray().SequenceEqual(new byte[] { 1, 2, 3 })).IsTrue();
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(7UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(10UL);
+            await AssertEntriesEqual(reopened.Entries(7, 11, ulong.MaxValue), CreateEntries(7, 4));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Reopen_AfterASnapshotAboveAnEarlierCompaction()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 10));
+                storage.Compact(3);
+                storage.CreateSnapshot(6, new Configuration.ConfState(TwoVoters), new byte[] { 6 });
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(7UL);
+            await AssertEntriesEqual(reopened.Entries(7, 11, ulong.MaxValue), CreateEntries(7, 4));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Reopen_RefusesADamagedSnapshot()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 4));
+                storage.CreateSnapshot(3, new Configuration.ConfState(TwoVoters), new byte[] { 1, 2, 3, 4 });
+            }
+
+            string snapshotPath = Path.Combine(directory, "snapshot");
+            using (var stream = new FileStream(snapshotPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            {
+                stream.SetLength(stream.Length - 3);
+            }
+
+            // The snapshot holds the application state; opening without it would lose that state silently.
+            await Assert.That(() => new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+                .Throws<InvalidDataException>();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task ApplySnapshot_InstallsBoundaryAndMatchesMemoryStorage()
     {
         string directory = CreateDirectory();

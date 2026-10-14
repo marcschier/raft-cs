@@ -66,6 +66,124 @@ public sealed class FileStorageNodeDurabilityTests
         }
     }
 
+    [Test]
+    public async Task Restart_DeliversTheSnapshotThenTheEntriesAfterIt()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "raft-node-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var before = new List<CommittedItem>();
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.SetConfState(new ConfState(new ulong[] { 1 }));
+                await using var network = new InMemoryNetwork();
+                RaftNode node = CreateNode(storage, network);
+                try
+                {
+                    await node.StartAsync();
+                    await node.CampaignAsync();
+                    await WaitUntilAsync(() => node.IsLeader);
+                    for (int i = 0; i < 6; i++)
+                    {
+                        await node.ProposeAsync(Encoding.UTF8.GetBytes($"v{i}"));
+                    }
+
+                    while (before.Count < 6)
+                    {
+                        before.Add(await node.CommittedItems.ReadAsync(timeout.Token));
+                    }
+
+                    // Snapshot the state after v3, and keep only the log after it.
+                    await node.CreateSnapshotAsync(before[3].Index, Encoding.UTF8.GetBytes("v0,v1,v2,v3"));
+                    await node.CompactAsync(before[3].Index);
+                }
+                finally
+                {
+                    await node.DisposeAsync();
+                }
+            }
+
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                await using var network = new InMemoryNetwork();
+                RaftNode node = CreateNode(storage, network);
+                try
+                {
+                    await node.StartAsync();
+                    CommittedItem snapshot = await node.CommittedItems.ReadAsync(timeout.Token);
+                    CommittedItem v4 = await node.CommittedItems.ReadAsync(timeout.Token);
+                    CommittedItem v5 = await node.CommittedItems.ReadAsync(timeout.Token);
+
+                    await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+                    await Assert.That(snapshot.Index).IsEqualTo(before[3].Index);
+                    await Assert.That(Encoding.UTF8.GetString(snapshot.Data.ToArray())).IsEqualTo("v0,v1,v2,v3");
+                    await Assert.That(v4.Index).IsEqualTo(before[4].Index);
+                    await Assert.That(Encoding.UTF8.GetString(v4.Data.ToArray())).IsEqualTo("v4");
+                    await Assert.That(v5.Index).IsEqualTo(before[5].Index);
+                    await Assert.That(Encoding.UTF8.GetString(v5.Data.ToArray())).IsEqualTo("v5");
+                }
+                finally
+                {
+                    await node.DisposeAsync();
+                }
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task Restart_RefusesALogCompactedPastTheSnapshot()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "raft-node-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                var entries = new Entry[10];
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    entries[i] = new Entry(EntryType.Normal, 1, (ulong)i + 1, new byte[] { (byte)i });
+                }
+
+                storage.SetConfState(new ConfState(new ulong[] { 1 }));
+                storage.Append(entries);
+                storage.SetHardState(new HardState(1, 1, 10));
+                storage.CreateSnapshot(4, new ConfState(new ulong[] { 1 }), new byte[] { 4 });
+                storage.Compact(6);
+            }
+
+            // Entries 5 and 6 are in neither the snapshot nor the log, so the state machine cannot be rebuilt.
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await using var network = new InMemoryNetwork();
+            await Assert.That(() => CreateNode(reopened, network)).Throws<InvalidOperationException>();
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    private static RaftNode CreateNode(FileRaftStorage storage, InMemoryNetwork network)
+    {
+        return new RaftNode(
+            new RaftConfig { Id = 1, RandomizedElectionTimeout = 5 },
+            storage,
+            network.CreateNode(1),
+            new RaftNodeOptions { TickInterval = TimeSpan.FromMilliseconds(10) });
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));

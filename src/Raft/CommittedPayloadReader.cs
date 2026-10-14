@@ -6,8 +6,8 @@ namespace Raft;
 
 /// <summary>
 /// The <see cref="RaftNode.Committed"/> view of the apply stream: the command payloads of the items queued for
-/// <see cref="RaftNode.CommittedItems"/>. Both readers take items from the same queue, so each command is delivered
-/// once, to whichever reader takes it.
+/// <see cref="RaftNode.CommittedItems"/>, without snapshots. Both readers take items from the same queue, so each
+/// command is delivered once, to whichever reader takes it.
 /// </summary>
 internal sealed class CommittedPayloadReader : ChannelReader<ReadOnlyMemory<byte>>
 {
@@ -25,10 +25,13 @@ internal sealed class CommittedPayloadReader : ChannelReader<ReadOnlyMemory<byte
 
     public override bool TryRead(out ReadOnlyMemory<byte> item)
     {
-        if (_items.TryRead(out CommittedItem? next))
+        while (_items.TryRead(out CommittedItem? next))
         {
-            item = next.Data;
-            return true;
+            if (next.Kind == CommittedItemKind.Command)
+            {
+                item = next.Data;
+                return true;
+            }
         }
 
         item = default;
@@ -37,10 +40,16 @@ internal sealed class CommittedPayloadReader : ChannelReader<ReadOnlyMemory<byte
 
     public override bool TryPeek(out ReadOnlyMemory<byte> item)
     {
-        if (_items.TryPeek(out CommittedItem? next))
+        while (_items.TryPeek(out CommittedItem? next))
         {
-            item = next.Data;
-            return true;
+            if (next.Kind == CommittedItemKind.Command)
+            {
+                item = next.Data;
+                return true;
+            }
+
+            // A snapshot is not delivered by this view; drop it, exactly as TryRead skips it.
+            _items.TryRead(out _);
         }
 
         item = default;

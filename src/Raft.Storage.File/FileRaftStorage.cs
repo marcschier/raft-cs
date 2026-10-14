@@ -6,11 +6,12 @@ using Raft.Configuration;
 namespace Raft.Storage.File;
 
 /// <summary>A simple crash-safe file-backed implementation of <see cref="IRaftStorage"/>.</summary>
-public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
+public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
 {
     private const string LogFileName = "log";
     private const string HardStateFileName = "hardstate";
     private const string SnapshotFileName = "snapshot";
+    private const string NewSnapshotFileName = "snapshot.new";
     private const byte EntryRecord = 0;
     private const byte TruncateRecord = 1;
     private const byte CompactRecord = 2;
@@ -23,6 +24,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private readonly object _gate = new();
     private readonly string _hardStatePath;
     private readonly string _snapshotPath;
+    private readonly string _newSnapshotPath;
     private readonly bool _fsync;
     private readonly List<Entry> _entries = new() { default };
     private readonly FileStream _logStream;
@@ -41,6 +43,10 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         string logPath = Path.Combine(options.DirectoryPath, LogFileName);
         _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
         _snapshotPath = Path.Combine(options.DirectoryPath, SnapshotFileName);
+        _newSnapshotPath = Path.Combine(options.DirectoryPath, NewSnapshotFileName);
+
+        // A snapshot that was still being written when the process stopped is incomplete; the former one is intact.
+        System.IO.File.Delete(_newSnapshotPath);
 
         LoadSnapshot();
         LoadHardState();
@@ -274,6 +280,37 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         FlushLog();
     }
 
+    /// <inheritdoc/>
+    public Snapshot CreateSnapshot(ulong index, ConfState confState, ReadOnlyMemory<byte> data)
+    {
+        ThrowIfNull(confState);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (index <= _snapshot.Metadata.Index)
+            {
+                throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
+            }
+
+            ulong term = TermLocked(index);
+            var snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), data.ToArray());
+            WriteSnapshot(snapshot);
+            _snapshot = snapshot;
+            return snapshot;
+        }
+    }
+
+    /// <inheritdoc/>
+    public Snapshot? LatestSnapshot()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            return _snapshot.IsEmpty ? null : _snapshot;
+        }
+    }
+
     /// <summary>Compacts the in-memory log up to (and excluding) <paramref name="compactIndex"/>.</summary>
     /// <param name="compactIndex">The first index to retain.</param>
     public void Compact(ulong compactIndex)
@@ -443,10 +480,12 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             return;
         }
 
+        // The snapshot file is replaced as a whole, never written in place, so a damaged one is not a torn write. It
+        // holds the application state, so it is refused rather than ignored.
         byte[] data = System.IO.File.ReadAllBytes(_snapshotPath);
         if (data.Length < 8 + 8 + 4)
         {
-            return;
+            throw DamagedSnapshot();
         }
 
         int offset = 0;
@@ -456,20 +495,24 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         offset += 4;
         if (dataLength < 0 || data.Length < offset + dataLength)
         {
-            return;
+            throw DamagedSnapshot();
         }
 
         byte[] snapshotData = data.AsSpan(offset, dataLength).ToArray();
         offset += dataLength;
-        if (!TryReadConfState(data, ref offset, out ConfState? confState) || confState is null)
+        if (!TryReadConfState(data, ref offset, out ConfState? confState) || confState is null
+            || offset != data.Length)
         {
-            return;
+            throw DamagedSnapshot();
         }
 
         _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData);
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, term, index, default));
     }
+
+    private InvalidDataException DamagedSnapshot() =>
+        new($"The snapshot file '{_snapshotPath}' is damaged.");
 
     private void LoadHardState()
     {
@@ -554,8 +597,14 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 if (payload.Length == 1 + UInt64Size)
                 {
                     int offset = 1;
-                    Entry boundary = CompactCore(ReadUInt64(payload, ref offset));
-                    _entries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
+                    ulong compactIndex = ReadUInt64(payload, ref offset);
+
+                    // A snapshot recorded after this compaction already covers it.
+                    if (compactIndex > _entries[0].Index)
+                    {
+                        Entry boundary = CompactCore(compactIndex);
+                        _entries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
+                    }
                 }
 
                 break;
@@ -676,14 +725,23 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         snapshot.Data.Span.CopyTo(data.AsSpan(offset));
         offset += snapshot.Data.Length;
         WriteConfState(data, ref offset, snapshot.Metadata.ConfState);
-        WriteAllBytesDurable(_snapshotPath, data);
-    }
 
-    private void WriteAllBytesDurable(string path, byte[] data)
-    {
-        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
-        stream.Write(data, 0, data.Length);
-        stream.Flush(_fsync);
+        // Written beside the snapshot and then swapped in, so after a crash either the former or the new snapshot is
+        // in place.
+        using (var stream = new FileStream(_newSnapshotPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            stream.Write(data, 0, data.Length);
+            stream.Flush(_fsync);
+        }
+
+        if (System.IO.File.Exists(_snapshotPath))
+        {
+            System.IO.File.Replace(_newSnapshotPath, _snapshotPath, destinationBackupFileName: null);
+        }
+        else
+        {
+            System.IO.File.Move(_newSnapshotPath, _snapshotPath);
+        }
     }
 
     private ulong TermLocked(ulong index)
