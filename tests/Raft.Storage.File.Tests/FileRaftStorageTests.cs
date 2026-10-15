@@ -374,7 +374,7 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
-    public async Task LegacySnapshotFile_HasAnUnknownMembershipIndex_AndIsNotServed()
+    public async Task LegacySnapshotFile_KeepsItsState_WithAnUnknownMembershipIndex_AndIsNotSent()
     {
         string directory = CreateDirectory();
         try
@@ -386,19 +386,23 @@ public sealed class FileRaftStorageTests
                 .Append(CreateEntries(5, 2))
                 .HardState(new HardState(6, 0, 6))
                 .WriteTo(directory);
-            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 4, latest);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 4, latest, new byte[] { 4, 4 });
 
             using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
             await Assert.That(storage.InitialState().ConfState.Equals(latest)).IsTrue();
             await Assert.That(storage.ConfStateIndex()).IsNull();
-            await Assert.That(storage.LatestSnapshot()).IsNull();
             await Assert.That(storage.FirstIndex()).IsEqualTo(5UL);
             await AssertEntriesEqual(storage.Entries(5, 7, ulong.MaxValue), CreateEntries(5, 2));
 
-            // Its membership is not the one at index 4, so a follower is sent the membership at the commit index.
-            Snapshot served = storage.Snapshot(4);
-            await Assert.That(served.Metadata.Index).IsEqualTo(6UL);
-            await Assert.That(served.Metadata.ConfState.Equals(latest)).IsTrue();
+            // The application state up to index 4 is still restored on start.
+            Snapshot? latestSnapshot = storage.LatestSnapshot();
+            await Assert.That(latestSnapshot).IsNotNull();
+            await Assert.That(latestSnapshot!.Metadata.Index).IsEqualTo(4UL);
+            await Assert.That(latestSnapshot.Data.ToArray().SequenceEqual(new byte[] { 4, 4 })).IsTrue();
+
+            // Its membership is not the one at index 4, so a follower waits for a newer snapshot.
+            await AssertStorageError(() => storage.Snapshot(0), RaftStorageError.SnapshotTemporarilyUnavailable);
+            await AssertStorageError(() => storage.Snapshot(6), RaftStorageError.SnapshotTemporarilyUnavailable);
         }
         finally
         {
@@ -425,6 +429,7 @@ public sealed class FileRaftStorageTests
             {
                 Snapshot created = storage.CreateSnapshot(6, atSix, new byte[] { 6 });
                 await Assert.That(storage.LatestSnapshot()).IsSameReferenceAs(created);
+                await Assert.That(storage.Snapshot(0)).IsSameReferenceAs(created);
             }
 
             using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });

@@ -103,11 +103,27 @@ public sealed class RaftNodeMembershipRecoveryTests
     [Test]
     public async Task Restart_WithTheMembershipAheadOfTheStoredCommit_DoesNotReapplyItsChangesLater()
     {
+        await RestartWithTheMembershipAheadOfTheStoredCommit(withSnapshot: false);
+    }
+
+    [Test]
+    public async Task Restart_WithTheMembershipAheadOfTheStoredCommitAndAnOlderSnapshot_KeepsTheNewerMembership()
+    {
+        await RestartWithTheMembershipAheadOfTheStoredCommit(withSnapshot: true);
+    }
+
+    private static async Task RestartWithTheMembershipAheadOfTheStoredCommit(bool withSnapshot)
+    {
         await using var network = new InMemoryNetwork();
         ConfState latest = Changer.Apply(
             Changer.Apply(Changer.Apply(Initial, EnterJointRemove2), Leave),
             EnterJointAdd3);
         MemoryStorage storage = CreateCommittedLog();
+        if (withSnapshot)
+        {
+            // The application state after index 1, with the membership at index 1.
+            storage.CreateSnapshot(1, Initial, new byte[] { 1 });
+        }
 
         // The membership after index 4 was recorded, but the process stopped before the commit of index 4 was durable.
         storage.SetHardState(new HardState(1, 0, 1));
@@ -125,6 +141,14 @@ public sealed class RaftNodeMembershipRecoveryTests
             await Assert.That(node.Configuration.Equals(latest)).IsTrue();
 
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            if (withSnapshot)
+            {
+                // The application still restores the snapshot before the commands after it.
+                CommittedItem snapshot = await node.CommittedItems.ReadAsync(timeout.Token);
+                await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+                await Assert.That(snapshot.Index).IsEqualTo(1UL);
+            }
+
             await leader.StartAsync(timeout.Token);
             await node.StartAsync(timeout.Token);
 

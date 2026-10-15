@@ -345,6 +345,138 @@ public sealed class FileStorageNodeDurabilityTests
         }
     }
 
+    [Test]
+    public async Task Restart_FromALegacySnapshotWithState_DeliversItThenTheCommandsAfterIt()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "raft-node-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            // An earlier version installed a snapshot of the state after index 4, which replaced the log up to it, then
+            // committed two commands; its SetConfState stored the latest membership in the snapshot file.
+            new LegacyStoreFormat.Log()
+                .HardState(new HardState(1, 0, 4))
+                .Append(
+                    new Entry(EntryType.Normal, 1, 5, Encoding.UTF8.GetBytes("v4")),
+                    new Entry(EntryType.Normal, 1, 6, Encoding.UTF8.GetBytes("v5")))
+                .HardState(new HardState(1, 0, 6))
+                .WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(
+                directory, 4, 1, AfterJointChanges, Encoding.UTF8.GetBytes("v0,v1,v2,v3"));
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await using var network = new InMemoryNetwork();
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            RaftNode node = CreateNode(storage, network);
+            try
+            {
+                CommittedItem snapshot = await node.CommittedItems.ReadAsync(timeout.Token);
+                CommittedItem v4 = await node.CommittedItems.ReadAsync(timeout.Token);
+                CommittedItem v5 = await node.CommittedItems.ReadAsync(timeout.Token);
+
+                await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+                await Assert.That(snapshot.Index).IsEqualTo(4UL);
+                await Assert.That(Encoding.UTF8.GetString(snapshot.Data.ToArray())).IsEqualTo("v0,v1,v2,v3");
+                await Assert.That(v4.Index).IsEqualTo(5UL);
+                await Assert.That(Encoding.UTF8.GetString(v4.Data.ToArray())).IsEqualTo("v4");
+                await Assert.That(v5.Index).IsEqualTo(6UL);
+                await Assert.That(Encoding.UTF8.GetString(v5.Data.ToArray())).IsEqualTo("v5");
+
+                // The membership is the stored one, not taken as the one at index 4, and its index stays unknown.
+                await Assert.That(node.Configuration.Equals(AfterJointChanges)).IsTrue();
+                await Assert.That(storage.ConfStateIndex()).IsNull();
+
+                // Until the application records a new snapshot, a lagging follower is not sent this one.
+                RaftStorageError? error = null;
+                try
+                {
+                    storage.Snapshot(0);
+                }
+                catch (RaftStorageException ex)
+                {
+                    error = ex.Error;
+                }
+
+                await Assert.That(error).IsEqualTo(RaftStorageError.SnapshotTemporarilyUnavailable);
+            }
+            finally
+            {
+                await node.DisposeAsync();
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task LeaderWithALegacySnapshot_CatchesUpAFollowerOnlyFromANewSnapshot()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "raft-node-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            // Node 1 kept a snapshot of the state after index 4 from an earlier version, then committed v4 and v5.
+            var voters = new ConfState(new ulong[] { 1, 2 });
+            new LegacyStoreFormat.Log()
+                .HardState(new HardState(1, 0, 4))
+                .Append(
+                    new Entry(EntryType.Normal, 1, 5, Encoding.UTF8.GetBytes("v4")),
+                    new Entry(EntryType.Normal, 1, 6, Encoding.UTF8.GetBytes("v5")))
+                .HardState(new HardState(1, 0, 6))
+                .WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 1, voters, Encoding.UTF8.GetBytes("v0,v1,v2,v3"));
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await using var network = new InMemoryNetwork();
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            RaftNode leader = new(
+                new RaftConfig { Id = 1, ElectionTick = 10, HeartbeatTick = 1, RandomizedElectionTimeout = 6 },
+                storage,
+                network.CreateNode(1),
+                new RaftNodeOptions { TickInterval = TimeSpan.FromMilliseconds(10) });
+            RaftNode follower = new(
+                new RaftConfig { Id = 2, ElectionTick = 10, HeartbeatTick = 1, RandomizedElectionTimeout = 30 },
+                new MemoryStorage(voters),
+                network.CreateNode(2),
+                new RaftNodeOptions { TickInterval = TimeSpan.FromMilliseconds(10) });
+            try
+            {
+                await leader.StartAsync(timeout.Token);
+                await follower.StartAsync(timeout.Token);
+                await WaitUntilAsync(() => leader.IsLeader);
+
+                // The follower's log ends before the leader's, which starts after the legacy snapshot: the leader has
+                // no snapshot it may send until its application records one.
+                await Task.Delay(300, timeout.Token);
+                await Assert.That(follower.CommittedItems.TryRead(out _)).IsFalse();
+
+                await leader.CreateSnapshotAsync(6, Encoding.UTF8.GetBytes("v0,v1,v2,v3,v4,v5"), timeout.Token);
+                CommittedItem snapshot = await follower.CommittedItems.ReadAsync(timeout.Token);
+
+                await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+                await Assert.That(snapshot.Index).IsEqualTo(6UL);
+                await Assert.That(Encoding.UTF8.GetString(snapshot.Data.ToArray())).IsEqualTo("v0,v1,v2,v3,v4,v5");
+            }
+            finally
+            {
+                await follower.DisposeAsync();
+                await leader.DisposeAsync();
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
     /// <summary>
     /// Entries that enter a joint configuration removing node 2, leave it, and enter a joint configuration adding
     /// node 3. Re-applying the first two to the configuration after the third changes its outgoing voters.

@@ -14,7 +14,7 @@ A state machine is just a fold over the committed command stream. Three rules ma
 2. **Track the applied index durably**, alongside your state. On restart you must not re-apply commands you already applied (the log replays from the last snapshot/compaction point, which may be behind your state machine).
 3. **Make apply idempotent or index-guarded**, because after a crash you may see a command you already applied.
 
-`CommittedItems` delivers each committed command with its log index (`CommittedItem.Index`) and term, so the index of the last item you applied is the log position your state corresponds to. Guard with it to skip already-applied commands:
+`CommittedItems` delivers each committed command with its log index (`CommittedItem.Index`) and term, so the index of the last item you applied is the log position your state corresponds to. It also delivers snapshots (`CommittedItemKind.Snapshot`) that replace your state; see [Snapshots and log compaction](#snapshots-and-log-compaction). Guard with the index to skip already-applied items:
 
 ```csharp
 ulong applied = LoadAppliedIndexFromMyStore(); // durable, next to your state
@@ -26,7 +26,15 @@ await foreach (CommittedItem item in node.CommittedItems.ReadAllAsync(ct))
         continue; // already applied before the crash
     }
 
-    ApplyToMyState(item.Data.Span);   // mutate your state machine
+    if (item.Kind == CommittedItemKind.Snapshot)
+    {
+        RestoreMyState(item.Data.Span);   // replaces the whole state
+    }
+    else
+    {
+        ApplyToMyState(item.Data.Span);   // mutate your state machine
+    }
+
     applied = item.Index;
     PersistMyStateAndAppliedIndex();  // durably, together
 }
@@ -89,8 +97,8 @@ Without compaction the log grows forever. Compaction discards the already-applie
 The snapshot carries your *application* state, which only your code knows, so your state machine creates it and the node does the rest:
 
 - **Create.** `RaftNode.CreateSnapshotAsync(index, data)` records your serialized state at `index` (the `CommittedItem.Index` of the last item you applied) in the storage, with the cluster membership at that index. The storage must implement `IRaftSnapshotStorage`; `MemoryStorage` and `FileRaftStorage` do.
-- **Compact.** `RaftNode.CompactAsync(index)` then discards the log up to `index` on the driver loop. It refuses to compact past the latest snapshot, because the snapshot and the log after it must together hold every applied command. `FileRaftStorage` rewrites its log file to the retained entries.
-- **Lagging followers.** The leader sends the latest snapshot to any follower whose next index falls below the compacted boundary. Once the follower has stored it, its `CommittedItems` stream delivers it as a `CommittedItemKind.Snapshot` item: replace your state with `item.Data`, then apply the commands after it.
+- **Compact.** `RaftNode.CompactAsync(index)` then discards the log up to `index` on the driver loop. It refuses to compact past the latest snapshot, because the snapshot and the log after it must together hold every applied command. `FileRaftStorage` drops the compacted entries from memory and appends a compaction record to its log file; in this version compaction does not shrink the file.
+- **Lagging followers.** The leader sends the latest snapshot to any follower whose next index falls below the compacted boundary. Once the follower has stored it, its `CommittedItems` stream delivers it as a `CommittedItemKind.Snapshot` item: replace your state with `item.Data`, then apply the commands after it. A snapshot `FileRaftStorage` kept from an earlier version is restored on restart but never sent, because it does not record the membership at its index; until your application records a new snapshot with `CreateSnapshotAsync`, a follower behind it waits.
 - **Restart.** When the storage holds a snapshot, `CommittedItems` starts with it, followed by the commands after it. A storage whose log was compacted past its latest snapshot is refused (`InvalidOperationException`), because the commands in between are lost.
 
 A compaction loop inside your state machine's apply loop:

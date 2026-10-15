@@ -88,7 +88,7 @@ The current values are also available synchronously: `node.IsLeader`, `node.Lead
 
 ## Bound the log (compaction)
 
-The log grows with every committed command. Snapshot your state machine at the index of the last item it applied, then discard the log up to that index so the on-disk log stays bounded:
+The log grows with every committed command. Snapshot your state machine at the index of the last item it applied, then discard the log up to that index so the log the node keeps in memory stays bounded (`FileRaftStorage` does not shrink its file on compaction in this version):
 
 ```csharp
 // appliedIndex is the CommittedItem.Index of the last item your state machine applied.

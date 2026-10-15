@@ -44,9 +44,6 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
     private ConfState _confState = new();
     private ulong? _confStateIndex = 0;
     private ulong? _pendingConfStateIndex;
-
-    // The snapshot file was written by an earlier version: its membership is the latest one, not the one at its index.
-    private bool _legacySnapshotFile;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -169,9 +166,19 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         lock (_gate)
         {
             ThrowIfDisposed();
-            if (!_snapshot.IsEmpty && !_legacySnapshotFile && requestIndex <= _snapshot.Metadata.Index)
+            if (!_snapshot.IsEmpty)
             {
-                return _snapshot;
+                // A snapshot kept from an earlier version holds the application state but not the membership at its
+                // index, and the log before it is gone: a follower can be caught up only from a newer snapshot.
+                if (!_snapshot.MembershipIsAtIndex)
+                {
+                    throw new RaftStorageException(RaftStorageError.SnapshotTemporarilyUnavailable);
+                }
+
+                if (requestIndex <= _snapshot.Metadata.Index)
+                {
+                    return _snapshot;
+                }
             }
 
             ulong appliedIndex = _hardState.Commit;
@@ -298,7 +305,6 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         }
 
         WriteSnapshot(snapshot);
-        _legacySnapshotFile = false;
         ResetLogFile();
         _snapshot = CopySnapshot(snapshot);
         _confState = snapshot.Metadata.ConfState;
@@ -326,7 +332,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
 
             ulong term = TermLocked(index);
             var snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), data.ToArray());
-            if (_legacySnapshotFile)
+            if (!_snapshot.MembershipIsAtIndex)
             {
                 // The current membership is stored only in the snapshot file this one replaces; keep it in the log.
                 if (_confStateIndex is { } confStateIndex)
@@ -342,19 +348,22 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             }
 
             WriteSnapshot(snapshot);
-            _legacySnapshotFile = false;
             _snapshot = snapshot;
             return snapshot;
         }
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// A snapshot kept from an earlier version of this store holds the latest membership the store recorded, not
+    /// necessarily the one at its index.
+    /// </remarks>
     public Snapshot? LatestSnapshot()
     {
         lock (_gate)
         {
             ThrowIfDisposed();
-            return _snapshot.IsEmpty || _legacySnapshotFile ? null : _snapshot;
+            return _snapshot.IsEmpty ? null : _snapshot;
         }
     }
 
@@ -585,18 +594,15 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         // Without the marker, an earlier version wrote the file: its membership is the latest one the store recorded,
         // not the one at the snapshot's index, so the index that membership reflects is unknown.
         ReadOnlySpan<byte> trailer = data.AsSpan(offset);
-        if (trailer.IsEmpty)
-        {
-            _legacySnapshotFile = true;
-        }
-        else if (!trailer.SequenceEqual(PointInTimeMembershipMarker))
+        bool membershipIsAtIndex = !trailer.IsEmpty;
+        if (membershipIsAtIndex && !trailer.SequenceEqual(PointInTimeMembershipMarker))
         {
             throw DamagedSnapshot();
         }
 
-        _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData);
+        _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData, membershipIsAtIndex);
         _confState = confState;
-        _confStateIndex = _legacySnapshotFile ? null : index;
+        _confStateIndex = membershipIsAtIndex ? index : null;
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, term, index, default));
     }

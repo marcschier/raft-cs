@@ -294,12 +294,74 @@ public sealed class RaftNodeSnapshotDeliveryTests
             await Assert.That(node.Committed.CanPeek).IsFalse();
             await Assert.That(node.Committed.TryPeek(out _)).IsFalse();
 
+            // Only the snapshot is queued, which this reader skips.
+            await Assert.That(node.Committed.CanCount).IsTrue();
+            await Assert.That(node.Committed.Count).IsEqualTo(0);
+            await Assert.That(node.CommittedItems.Count).IsEqualTo(1);
+
             CommittedItem snapshot = await node.CommittedItems.ReadAsync();
             await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
         }
         finally
         {
             await node.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task Committed_CountsTheQueuedCommandsOnly()
+    {
+        await using var network = new InMemoryNetwork();
+
+        // Read through the item reader: it takes the snapshot, then a command.
+        RaftNode node = CreateSingleNode(network, CreateSnapshotAndTwoCommands());
+        try
+        {
+            await AssertCounts(node, commands: 2, items: 3);
+            await Assert.That((await node.CommittedItems.ReadAsync()).Kind).IsEqualTo(CommittedItemKind.Snapshot);
+            await AssertCounts(node, commands: 2, items: 2);
+            await node.Committed.ReadAsync();
+            await AssertCounts(node, commands: 1, items: 1);
+            await node.CommittedItems.ReadAsync();
+            await AssertCounts(node, commands: 0, items: 0);
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+
+        // Read through the payload reader: it skips the snapshot and takes the first command.
+        await using var otherNetwork = new InMemoryNetwork();
+        node = CreateSingleNode(otherNetwork, CreateSnapshotAndTwoCommands());
+        try
+        {
+            ReadOnlyMemory<byte> first = await node.Committed.ReadAsync();
+            await Assert.That(first.ToArray().SequenceEqual(new byte[] { 2 })).IsTrue();
+            await AssertCounts(node, commands: 1, items: 1);
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+
+        static MemoryStorage CreateSnapshotAndTwoCommands()
+        {
+            var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+            storage.Append(new[]
+            {
+                new Entry(EntryType.Normal, 1, 1, new byte[] { 1 }),
+                new Entry(EntryType.Normal, 1, 2, new byte[] { 2 }),
+                new Entry(EntryType.Normal, 1, 3, new byte[] { 3 }),
+            });
+            storage.SetHardState(new HardState(1, 0, 3));
+            storage.CreateSnapshot(1, new ConfState(new ulong[] { 1 }), new byte[] { 1 });
+            return storage;
+        }
+
+        static async Task AssertCounts(RaftNode node, int commands, int items)
+        {
+            await Assert.That(node.Committed.Count).IsEqualTo(commands);
+            await Assert.That(node.CommittedItems.Count).IsEqualTo(items);
         }
     }
 

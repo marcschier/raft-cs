@@ -23,8 +23,7 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly RaftNodeOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly Channel<object> _inbox;
-    private readonly Channel<CommittedItem> _committed;
-    private readonly CommittedPayloadReader _committedPayloads;
+    private readonly CommittedQueue _committed = new();
     private readonly Channel<RaftStateChange> _stateChanges;
     private readonly Channel<ConfState> _confChanges;
     private readonly CancellationTokenSource _stop = new();
@@ -90,17 +89,10 @@ public sealed class RaftNode : IAsyncDisposable
             SingleReader = true,
             SingleWriter = false,
         });
-        _committed = Channel.CreateUnbounded<CommittedItem>(new UnboundedChannelOptions
-        {
-            SingleReader = false,
-            SingleWriter = true,
-        });
-        _committedPayloads = new CommittedPayloadReader(_committed.Reader);
-
         // The application restores the latest snapshot before the entries after it are applied.
         if (restored is not null)
         {
-            _committed.Writer.TryWrite(CommittedItem.ForSnapshot(restored));
+            _committed.Write(CommittedItem.ForSnapshot(restored));
         }
 
         int capacity = _options.StateObservationCapacity;
@@ -161,9 +153,11 @@ public sealed class RaftNode : IAsyncDisposable
     /// <summary>
     /// Gets a reader over committed application command payloads, in log order. This is a view of
     /// <see cref="CommittedItems"/> without the log positions and without snapshots: both read the same queue, so a
-    /// consumer reads one of them.
+    /// consumer reads one of them. Its <see cref="ChannelReader{T}.Count"/> is the number of queued commands, without
+    /// the queued snapshots; while the other reader takes items concurrently, it is a point-in-time value, like the
+    /// count of any channel reader.
     /// </summary>
-    public ChannelReader<ReadOnlyMemory<byte>> Committed => _committedPayloads;
+    public ChannelReader<ReadOnlyMemory<byte>> Committed => _committed.Payloads;
 
     /// <summary>
     /// Gets a reader over the apply stream, in log order: committed application commands, each with its log index and
@@ -172,7 +166,7 @@ public sealed class RaftNode : IAsyncDisposable
     /// installs a snapshot from the leader. The index of the last item a state machine has applied is the log position
     /// its state corresponds to. This reads the same queue as <see cref="Committed"/>, so a consumer reads one of them.
     /// </summary>
-    public ChannelReader<CommittedItem> CommittedItems => _committed.Reader;
+    public ChannelReader<CommittedItem> CommittedItems => _committed.Items;
 
     /// <summary>
     /// Gets a reader over leadership/role transitions. The current state is emitted as the first item; thereafter a
@@ -277,7 +271,7 @@ public sealed class RaftNode : IAsyncDisposable
     }
 
     /// <summary>
-    /// Discards the applied log prefix up to (and excluding) <paramref name="index"/> to bound the on-disk log. The
+    /// Discards the applied log prefix up to (and excluding) <paramref name="index"/> from the storage. The
     /// compaction runs on the driver loop, serialized with all other storage access. A follower whose next index falls
     /// below the compacted boundary is automatically re-seeded with the latest snapshot, so for full state transfer to
     /// a far-behind follower the application records its state with <see cref="CreateSnapshotAsync"/> before it
@@ -395,7 +389,7 @@ public sealed class RaftNode : IAsyncDisposable
 
         _transport.FrameReceived -= OnFrameReceived;
         await _transport.DisposeAsync().ConfigureAwait(false);
-        _committed.Writer.TryComplete();
+        _committed.Complete();
         _stateChanges.Writer.TryComplete();
         _confChanges.Writer.TryComplete();
         _startGate.Dispose();
@@ -518,7 +512,7 @@ public sealed class RaftNode : IAsyncDisposable
         {
             // A storage write failure is unrecoverable for consensus: surface it to the committed-command consumer and
             // stop the driver loop.
-            _committed.Writer.TryComplete(ex);
+            _committed.Complete(ex);
             _stop.Cancel();
             return;
         }
@@ -562,7 +556,7 @@ public sealed class RaftNode : IAsyncDisposable
         {
             foreach (CommittedItem command in commands)
             {
-                _committed.Writer.TryWrite(command);
+                _committed.Write(command);
             }
         }
 
@@ -671,35 +665,40 @@ public sealed class RaftNode : IAsyncDisposable
                 + "cannot be restored.");
         }
 
-        _confState = snapshot.Metadata.ConfState;
-        _core.ApplyConfChange(_confState);
         _core.RestoreAppliedTo(snapshot.Metadata.Index);
         return snapshot;
     }
 
     /// <summary>
-    /// Records the recovered membership as the first entry of the configuration history and returns the log index up
-    /// to which it already reflects every committed configuration change, so recovery replays only the later ones.
+    /// Sets the recovered membership, records it as the first entry of the configuration history, and returns the log
+    /// index up to which it already reflects every committed configuration change, so recovery replays only the later
+    /// ones.
     /// </summary>
     private ulong RecoverConfigurationBaseline(Snapshot? restored)
     {
+        ulong? storedIndex = _confStateIndexStorage?.ConfStateIndex();
         ulong baselineIndex;
         ulong replayConfigurationChangesAfter;
-        if (restored is not null)
+        if (restored is { MembershipIsAtIndex: true } && !(storedIndex > restored.Metadata.Index))
         {
+            // The snapshot holds the membership at its index, and the store records none newer.
+            _confState = restored.Metadata.ConfState;
+            _core.ApplyConfChange(_confState);
             baselineIndex = restored.Metadata.Index;
             replayConfigurationChangesAfter = baselineIndex;
         }
-        else if (_confStateIndexStorage?.ConfStateIndex() is { } storedIndex)
+        else if (storedIndex is { } index)
         {
-            baselineIndex = storedIndex;
+            // The stored membership, which the core already uses, reflects the configuration changes up to its index.
+            baselineIndex = index;
             replayConfigurationChangesAfter = baselineIndex;
         }
         else
         {
             // The store does not record the index of its configuration (it does not implement
-            // IRaftConfStateIndexStorage, or the index is unknown): use it only from the latest committed configuration
-            // entry (or the commit index when none remains), and replay no recovered change.
+            // IRaftConfStateIndexStorage, or the index is unknown, as with a snapshot whose membership is not the one
+            // at its index): use it only from the latest committed configuration entry (or the commit index when none
+            // remains), and replay no recovered change.
             baselineIndex = LatestCommittedConfigurationIndex();
             replayConfigurationChangesAfter = _core.CommitIndex;
         }
@@ -732,7 +731,7 @@ public sealed class RaftNode : IAsyncDisposable
         ConfState confState = snapshot.Metadata.ConfState;
         _confHistory.Clear();
         _confHistory.Add(new KeyValuePair<ulong, ConfState>(snapshot.Metadata.Index, confState));
-        _committed.Writer.TryWrite(CommittedItem.ForSnapshot(snapshot));
+        _committed.Write(CommittedItem.ForSnapshot(snapshot));
 
         _publishedConfState = confState;
         _confChanges.Writer.TryWrite(confState);
