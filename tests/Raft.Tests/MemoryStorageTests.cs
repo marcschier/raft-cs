@@ -186,4 +186,20 @@ public sealed class MemoryStorageTests
         await Assert.That(() => storage.CreateSnapshot(2, new ConfState(new ulong[] { 1 }), state))
             .Throws<RaftStorageException>();
     }
+
+    [Test]
+    public async Task ApplySnapshot_OlderThanCreatedSnapshot_Throws()
+    {
+        var storage = new MemoryStorage();
+        storage.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.Normal, 1, 2, default),
+            new Entry(EntryType.Normal, 1, 3, default),
+        });
+        storage.CreateSnapshot(3, new ConfState(), default);
+
+        var older = new Snapshot(new SnapshotMetadata(2, 1, new ConfState()), default);
+        await Assert.That(() => storage.ApplySnapshot(older)).Throws<RaftStorageException>();
+    }
 }

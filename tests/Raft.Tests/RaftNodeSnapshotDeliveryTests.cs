@@ -101,6 +101,78 @@ public sealed class RaftNodeSnapshotDeliveryTests
     }
 
     [Test]
+    public async Task CompactAsync_RechecksASnapshotQueuedBeforeIt()
+    {
+        await using var network = new InMemoryNetwork();
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        RaftNode node = CreateSingleNode(network, storage);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await StartLeaderAsync(node, timeout.Token);
+            var state = new StateMachine();
+            for (int i = 0; i < 4; i++)
+            {
+                await node.ProposeAsync(Encoding.UTF8.GetBytes($"c{i}"));
+            }
+
+            while (state.Applied < 5)
+            {
+                state.Apply(await node.CommittedItems.ReadAsync(timeout.Token));
+            }
+
+            Task<SnapshotMetadata> snapshot = node.CreateSnapshotAsync(3, new byte[] { 3 });
+            Task compact = node.CompactAsync(5);
+            await snapshot;
+
+            await Assert.That(async () => await compact).Throws<ArgumentOutOfRangeException>();
+            await Assert.That(storage.FirstIndex()).IsEqualTo(1UL);
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task Restart_RestoresSnapshotMembershipBeforeReplayingJointChange()
+    {
+        await using var network = new InMemoryNetwork();
+        var initial = new ConfState(new ulong[] { 1, 2 });
+        ConfChangeV2 change = new(
+            new[] { new ConfChangeSingle(ConfChangeType.RemoveNode, 2) },
+            useJoint: true);
+        ConfState latest = Changer.Apply(initial, change);
+        var storage = new MemoryStorage(initial);
+        storage.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.ConfChangeV2, 1, 2, change.Encode()),
+        });
+        storage.SetHardState(new HardState(1, 0, 2));
+        storage.CreateSnapshot(1, initial, new byte[] { 1 });
+        storage.SetConfState(latest);
+
+        RaftNode node = CreateSingleNode(network, storage);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await node.StartAsync(timeout.Token);
+            while (node.AppliedIndex < 2)
+            {
+                await Task.Delay(10, timeout.Token);
+            }
+
+            await Assert.That(node.Configuration.Voters.SequenceEqual(new ulong[] { 1 })).IsTrue();
+            await Assert.That(node.Configuration.VotersOutgoing.SequenceEqual(initial.Voters)).IsTrue();
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task LaggingFollower_ReceivesTheLeadersSnapshotOnCommittedItems()
     {
         await using var cluster = new LaggingFollowerCluster();
@@ -130,6 +202,28 @@ public sealed class RaftNodeSnapshotDeliveryTests
         // A consumer of the payload view sees commands only; the leader's snapshot is not one.
         ReadOnlyMemory<byte> first = await cluster.Follower.Committed.ReadAsync(timeout.Token);
         await Assert.That(Encoding.UTF8.GetString(first.ToArray())).IsEqualTo("after-heal");
+    }
+
+    [Test]
+    public async Task Committed_DoesNotPeekOrDiscardSnapshots()
+    {
+        await using var network = new InMemoryNetwork();
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        storage.Append(new[] { new Entry(EntryType.Normal, 1, 1, default) });
+        storage.CreateSnapshot(1, new ConfState(new ulong[] { 1 }), new byte[] { 1 });
+        RaftNode node = CreateSingleNode(network, storage);
+        try
+        {
+            await Assert.That(node.Committed.CanPeek).IsFalse();
+            await Assert.That(node.Committed.TryPeek(out _)).IsFalse();
+
+            CommittedItem snapshot = await node.CommittedItems.ReadAsync();
+            await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
     }
 
     private static RaftNode CreateSingleNode(InMemoryNetwork network, MemoryStorage storage)

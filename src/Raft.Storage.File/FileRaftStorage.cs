@@ -1,6 +1,7 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using Raft.Configuration;
 
 namespace Raft.Storage.File;
@@ -16,6 +17,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
     private const byte TruncateRecord = 1;
     private const byte CompactRecord = 2;
     private const byte HardStateRecord = 3;
+    private const byte ConfStateRecord = 4;
     private const int LengthPrefixSize = 4;
     private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
     private const int HardStateRecordSize = 1 + (3 * 8);
@@ -25,11 +27,13 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
     private readonly string _hardStatePath;
     private readonly string _snapshotPath;
     private readonly string _newSnapshotPath;
+    private readonly string _directoryPath;
     private readonly bool _fsync;
     private readonly List<Entry> _entries = new() { default };
     private readonly FileStream _logStream;
     private HardState _hardState;
     private Snapshot _snapshot = new(new SnapshotMetadata(0, 0, new ConfState()), ReadOnlyMemory<byte>.Empty);
+    private ConfState _confState = new();
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -39,6 +43,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         ThrowIfNull(options);
 
         Directory.CreateDirectory(options.DirectoryPath);
+        _directoryPath = options.DirectoryPath;
         _fsync = options.Fsync;
         string logPath = Path.Combine(options.DirectoryPath, LogFileName);
         _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
@@ -61,7 +66,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            return (_hardState, _snapshot.Metadata.ConfState);
+            return (_hardState, _confState);
         }
     }
 
@@ -273,9 +278,11 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         WriteSnapshot(snapshot);
         ResetLogFile();
         _snapshot = CopySnapshot(snapshot);
+        _confState = snapshot.Metadata.ConfState;
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));
         _hardState = new HardState(Math.Max(_hardState.Term, snapshot.Metadata.Term), _hardState.Vote, index);
+        WriteConfStateRecord(_confState);
         WriteHardStateRecord(_hardState);
         FlushLog();
     }
@@ -347,9 +354,9 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            SnapshotMetadata metadata = _snapshot.Metadata;
-            _snapshot = new Snapshot(new SnapshotMetadata(metadata.Index, metadata.Term, confState), _snapshot.Data);
-            WriteSnapshot(_snapshot);
+            _confState = confState;
+            WriteConfStateRecord(confState);
+            FlushLog();
         }
     }
 
@@ -507,6 +514,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         }
 
         _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData);
+        _confState = confState;
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, term, index, default));
     }
@@ -619,6 +627,16 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
                 }
 
                 break;
+            case ConfStateRecord:
+                int confStateOffset = 1;
+                if (TryReadConfState(payload, ref confStateOffset, out ConfState? confState)
+                    && confState is not null
+                    && confStateOffset == payload.Length)
+                {
+                    _confState = confState;
+                }
+
+                break;
         }
     }
 
@@ -669,6 +687,15 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         WriteUInt64(payload, ref offset, hardState.Term);
         WriteUInt64(payload, ref offset, hardState.Vote);
         WriteUInt64(payload, ref offset, hardState.Commit);
+        WriteRecord(payload);
+    }
+
+    private void WriteConfStateRecord(ConfState confState)
+    {
+        byte[] payload = new byte[1 + ConfStateLength(confState)];
+        payload[0] = ConfStateRecord;
+        int offset = 1;
+        WriteConfState(payload, ref offset, confState);
         WriteRecord(payload);
     }
 
@@ -734,7 +761,14 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
             stream.Flush(_fsync);
         }
 
-        if (System.IO.File.Exists(_snapshotPath))
+        if (_fsync && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            if (!MoveFileEx(_newSnapshotPath, _snapshotPath, MoveFileReplaceExisting | MoveFileWriteThrough))
+            {
+                throw new IOException($"Could not publish snapshot durably (error {Marshal.GetLastWin32Error()}).");
+            }
+        }
+        else if (System.IO.File.Exists(_snapshotPath))
         {
             System.IO.File.Replace(_newSnapshotPath, _snapshotPath, destinationBackupFileName: null);
         }
@@ -742,7 +776,66 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         {
             System.IO.File.Move(_newSnapshotPath, _snapshotPath);
         }
+
+        FlushSnapshotDirectory();
     }
+
+    private void FlushSnapshotDirectory()
+    {
+        if (!_fsync)
+        {
+            return;
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            // MoveFileEx with MOVEFILE_WRITE_THROUGH publishes the rename synchronously on Windows, where
+            // FlushFileBuffers rejects directory handles.
+            return;
+        }
+
+        int directory = Open(_directoryPath, OpenReadOnly);
+        if (directory < 0)
+        {
+            throw new IOException($"Could not open snapshot directory for syncing (error {Marshal.GetLastWin32Error()}).");
+        }
+
+        int closeResult = 0;
+        try
+        {
+            if (Fsync(directory) != 0)
+            {
+                throw new IOException($"Could not sync snapshot directory (error {Marshal.GetLastWin32Error()}).");
+            }
+        }
+        finally
+        {
+            closeResult = Close(directory);
+        }
+
+        if (closeResult != 0)
+        {
+            throw new IOException(
+                $"Could not close snapshot directory after syncing (error {Marshal.GetLastWin32Error()}).");
+        }
+    }
+
+    private const uint MoveFileReplaceExisting = 0x00000001;
+    private const uint MoveFileWriteThrough = 0x00000008;
+    private const int OpenReadOnly = 0;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileEx(string existingFileName, string newFileName, uint flags);
+
+    [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    private static extern int Open(string path, int flags);
+
+    [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
+    private static extern int Fsync(int fileDescriptor);
+
+    [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+    private static extern int Close(int fileDescriptor);
 
     private ulong TermLocked(ulong index)
     {

@@ -559,6 +559,15 @@ public sealed class RaftNode : IAsyncDisposable
     {
         try
         {
+            if (_snapshotStorage?.LatestSnapshot() is { IsEmpty: false } latest
+                && request.Index > latest.Metadata.Index)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(request),
+                    request.Index,
+                    $"Cannot compact past the latest snapshot at index {latest.Metadata.Index}.");
+            }
+
             // No-op when the prefix is already compacted; otherwise discard the applied prefix on the loop thread,
             // serialized with every other storage access.
             if (request.Index >= _storage.FirstIndex())
@@ -629,6 +638,8 @@ public sealed class RaftNode : IAsyncDisposable
                 + "cannot be restored.");
         }
 
+        _confState = snapshot.Metadata.ConfState;
+        _core.ApplyConfChange(_confState);
         _core.RestoreAppliedTo(snapshot.Metadata.Index);
         return snapshot;
     }

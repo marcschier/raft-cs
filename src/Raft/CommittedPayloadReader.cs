@@ -21,7 +21,7 @@ internal sealed class CommittedPayloadReader : ChannelReader<ReadOnlyMemory<byte
 
     public override int Count => _items.Count;
 
-    public override bool CanPeek => _items.CanPeek;
+    public override bool CanPeek => false;
 
     public override bool TryRead(out ReadOnlyMemory<byte> item)
     {
@@ -40,18 +40,6 @@ internal sealed class CommittedPayloadReader : ChannelReader<ReadOnlyMemory<byte
 
     public override bool TryPeek(out ReadOnlyMemory<byte> item)
     {
-        while (_items.TryPeek(out CommittedItem? next))
-        {
-            if (next.Kind == CommittedItemKind.Command)
-            {
-                item = next.Data;
-                return true;
-            }
-
-            // A snapshot is not delivered by this view; drop it, exactly as TryRead skips it.
-            _items.TryRead(out _);
-        }
-
         item = default;
         return false;
     }

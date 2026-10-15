@@ -5,6 +5,7 @@ namespace Raft.Storage.File.Tests;
 public sealed class FileRaftStorageTests
 {
     private static readonly ulong[] TwoVoters = { 1UL, 2UL };
+    private static readonly ulong[] OneVoter = { 1UL };
     private static readonly ulong[] OneLearner = { 3UL };
 
     [Test]
@@ -125,6 +126,57 @@ public sealed class FileRaftStorageTests
             await Assert.That(reopened.FirstIndex()).IsEqualTo(7UL);
             await Assert.That(reopened.LastIndex()).IsEqualTo(10UL);
             await AssertEntriesEqual(reopened.Entries(7, 11, ulong.MaxValue), CreateEntries(7, 4));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Snapshot_PreservesItsMembershipWhenTheCurrentMembershipChanges()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var snapshotConfState = new Configuration.ConfState(TwoVoters);
+            var currentConfState = new Configuration.ConfState(OneVoter, OneLearner);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 4));
+                storage.CreateSnapshot(2, snapshotConfState, new byte[] { 2 });
+                storage.SetConfState(currentConfState);
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            Snapshot? snapshot = reopened.LatestSnapshot();
+            (HardState _, Configuration.ConfState restoredCurrent) = reopened.InitialState();
+            await Assert.That(snapshot).IsNotNull();
+            await Assert.That(snapshot!.Metadata.ConfState.Equals(snapshotConfState)).IsTrue();
+            await Assert.That(restoredCurrent.Equals(currentConfState)).IsTrue();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task CreateSnapshot_WithFsync_PublishesItDurably()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = true }))
+            {
+                storage.Append(CreateEntries(1, 2));
+                storage.CreateSnapshot(2, new Configuration.ConfState(TwoVoters), new byte[] { 2 });
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = true });
+            Snapshot? snapshot = reopened.LatestSnapshot();
+            await Assert.That(snapshot).IsNotNull();
+            await Assert.That(snapshot!.Metadata.Index).IsEqualTo(2UL);
         }
         finally
         {

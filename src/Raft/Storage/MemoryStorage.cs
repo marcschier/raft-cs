@@ -206,7 +206,8 @@ public sealed class MemoryStorage : IRaftSnapshotStorage
         lock (_gate)
         {
             ulong index = snapshot.Metadata.Index;
-            if (index <= _snapshotMetadata.Index)
+            ulong latestSnapshotIndex = _snapshot?.Metadata.Index ?? _snapshotMetadata.Index;
+            if (index <= latestSnapshotIndex)
             {
                 throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
             }
