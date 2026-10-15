@@ -37,7 +37,22 @@ public interface IRaftWritableStorage : IRaftStorage
     /// <param name="snapshot">The snapshot to install, or <see langword="null"/> when none.</param>
     void Write(IReadOnlyList<Entry> entries, HardState? hardState, Snapshot? snapshot);
 
-    /// <summary>Persists the committed configuration.</summary>
+    /// <summary>
+    /// Persists the committed configuration together with the log index up to which it reflects every committed
+    /// configuration change. On restart, a node replays only the configuration changes after that index.
+    /// </summary>
     /// <param name="confState">The configuration to store.</param>
-    void SetConfState(ConfState confState);
+    /// <param name="index">
+    /// The index of the last configuration-change entry <paramref name="confState"/> reflects, or zero for the
+    /// bootstrap membership of a new cluster.
+    /// </param>
+    void SetConfState(ConfState confState, ulong index);
+
+    /// <summary>
+    /// Returns the log index up to which the stored configuration reflects every committed configuration change: the
+    /// index passed to <see cref="SetConfState"/>, the index of an installed snapshot, or zero for the bootstrap
+    /// membership.
+    /// </summary>
+    /// <returns>The index, or <see langword="null"/> when the store does not record it.</returns>
+    ulong? ConfStateIndex();
 }

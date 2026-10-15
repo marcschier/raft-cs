@@ -18,6 +18,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
     private const byte CompactRecord = 2;
     private const byte HardStateRecord = 3;
     private const byte ConfStateRecord = 4;
+    private const byte ConfStateIndexRecord = 5;
     private const int LengthPrefixSize = 4;
     private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
     private const int HardStateRecordSize = 1 + (3 * 8);
@@ -34,6 +35,8 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
     private HardState _hardState;
     private Snapshot _snapshot = new(new SnapshotMetadata(0, 0, new ConfState()), ReadOnlyMemory<byte>.Empty);
     private ConfState _confState = new();
+    private ulong? _confStateIndex = 0;
+    private ulong? _pendingConfStateIndex;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -282,7 +285,8 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));
         _hardState = new HardState(Math.Max(_hardState.Term, snapshot.Metadata.Term), _hardState.Vote, index);
-        WriteConfStateRecord(_confState);
+        _confStateIndex = index;
+        WriteConfStateRecords(_confState, index);
         WriteHardStateRecord(_hardState);
         FlushLog();
     }
@@ -345,9 +349,8 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         }
     }
 
-    /// <summary>Overwrites the persisted committed configuration.</summary>
-    /// <param name="confState">The configuration to store.</param>
-    public void SetConfState(ConfState confState)
+    /// <inheritdoc/>
+    public void SetConfState(ConfState confState, ulong index)
     {
         ThrowIfNull(confState);
 
@@ -355,8 +358,19 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         {
             ThrowIfDisposed();
             _confState = confState;
-            WriteConfStateRecord(confState);
+            _confStateIndex = index;
+            WriteConfStateRecords(confState, index);
             FlushLog();
+        }
+    }
+
+    /// <inheritdoc/>
+    public ulong? ConfStateIndex()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            return _confStateIndex;
         }
     }
 
@@ -515,6 +529,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
 
         _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData);
         _confState = confState;
+        _confStateIndex = index;
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, term, index, default));
     }
@@ -588,6 +603,9 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
 
     private void ReplayRecord(ReadOnlySpan<byte> payload)
     {
+        // An index record belongs to the configuration record written right after it.
+        ulong? confStateIndex = _pendingConfStateIndex;
+        _pendingConfStateIndex = null;
         switch (payload[0])
         {
             case EntryRecord:
@@ -633,7 +651,17 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
                     && confState is not null
                     && confStateOffset == payload.Length)
                 {
+                    // A configuration without a preceding index record was written before the index was recorded.
                     _confState = confState;
+                    _confStateIndex = confStateIndex;
+                }
+
+                break;
+            case ConfStateIndexRecord:
+                if (payload.Length == 1 + UInt64Size)
+                {
+                    int offset = 1;
+                    _pendingConfStateIndex = ReadUInt64(payload, ref offset);
                 }
 
                 break;
@@ -690,8 +718,18 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         WriteRecord(payload);
     }
 
-    private void WriteConfStateRecord(ConfState confState)
+    /// <summary>
+    /// Writes the index record, then the configuration record it belongs to. A configuration record whose index record
+    /// is missing is one written before the index was recorded; one torn after the index record is ignored on replay.
+    /// </summary>
+    private void WriteConfStateRecords(ConfState confState, ulong index)
     {
+        Span<byte> indexPayload = stackalloc byte[1 + UInt64Size];
+        indexPayload[0] = ConfStateIndexRecord;
+        int indexOffset = 1;
+        WriteUInt64(indexPayload, ref indexOffset, index);
+        WriteRecord(indexPayload);
+
         byte[] payload = new byte[1 + ConfStateLength(confState)];
         payload[0] = ConfStateRecord;
         int offset = 1;

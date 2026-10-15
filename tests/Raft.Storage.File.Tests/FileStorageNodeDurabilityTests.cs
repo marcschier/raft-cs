@@ -20,7 +20,7 @@ public sealed class FileStorageNodeDurabilityTests
 
             using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
             {
-                storage.SetConfState(new ConfState(new ulong[] { 1 }));
+                storage.SetConfState(new ConfState(new ulong[] { 1 }), 0);
                 var node = new RaftNode(
                     new RaftConfig { Id = 1, RandomizedElectionTimeout = 5 },
                     storage,
@@ -77,7 +77,7 @@ public sealed class FileStorageNodeDurabilityTests
             var before = new List<CommittedItem>();
             using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
             {
-                storage.SetConfState(new ConfState(new ulong[] { 1 }));
+                storage.SetConfState(new ConfState(new ulong[] { 1 }), 0);
                 await using var network = new InMemoryNetwork();
                 RaftNode node = CreateNode(storage, network);
                 try
@@ -154,7 +154,7 @@ public sealed class FileStorageNodeDurabilityTests
                     entries[i] = new Entry(EntryType.Normal, 1, (ulong)i + 1, new byte[] { (byte)i });
                 }
 
-                storage.SetConfState(new ConfState(new ulong[] { 1 }));
+                storage.SetConfState(new ConfState(new ulong[] { 1 }), 0);
                 storage.Append(entries);
                 storage.SetHardState(new HardState(1, 1, 10));
                 storage.CreateSnapshot(4, new ConfState(new ulong[] { 1 }), new byte[] { 4 });
@@ -165,6 +165,49 @@ public sealed class FileStorageNodeDurabilityTests
             using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
             await using var network = new InMemoryNetwork();
             await Assert.That(() => CreateNode(reopened, network)).Throws<InvalidOperationException>();
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task Restart_ReplaysACommittedMembershipChangeAndRecordsIt()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "raft-node-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            ConfChangeV2 removeNode2 = ConfChangeV2.Single(ConfChangeType.RemoveNode, 2);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                // The commit of the change at index 2 is durable, but the process stopped before it was recorded.
+                storage.SetConfState(new ConfState(new ulong[] { 1, 2 }), 0);
+                storage.Write(
+                    new[]
+                    {
+                        new Entry(EntryType.Normal, 1, 1, default),
+                        new Entry(EntryType.ConfChangeV2, 1, 2, removeNode2.Encode()),
+                    },
+                    new HardState(1, 1, 2),
+                    null);
+            }
+
+            await using var network = new InMemoryNetwork();
+            using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                RaftNode node = CreateNode(reopened, network);
+                await Assert.That(node.Configuration.Voters.SequenceEqual(new ulong[] { 1 })).IsTrue();
+                await node.DisposeAsync();
+            }
+
+            using var recovered = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(recovered.InitialState().ConfState.Voters.SequenceEqual(new ulong[] { 1 })).IsTrue();
+            await Assert.That(recovered.ConfStateIndex()).IsEqualTo((ulong?)2);
         }
         finally
         {

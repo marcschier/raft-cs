@@ -59,7 +59,7 @@ Apply committed conf-change entries by computing the new `ConfState` (via `Chang
 | Type | Description |
 | --- | --- |
 | `IRaftStorage` | Read side: `InitialState`, `Entries`, `Term`, `FirstIndex`, `LastIndex`, `Snapshot`. |
-| `IRaftWritableStorage` | Adds `Append`, `ApplySnapshot`, `Compact`, `SetHardState`, `SetConfState`. |
+| `IRaftWritableStorage` | Adds `Append`, `ApplySnapshot`, `Compact`, `SetHardState`, `SetConfState` (the committed membership with the index of the last configuration change it reflects; zero to bootstrap), and `ConfStateIndex`. A restarting node replays only the committed configuration changes after that index. |
 | `IRaftSnapshotStorage` | Adds `CreateSnapshot` (application state at an index, keeping the log after it) and `LatestSnapshot`. Implemented by both built-in stores. |
 | `MemoryStorage` | Volatile in-memory store (package `RaftCs`). |
 | `FileRaftStorage` / `FileRaftStorageOptions` | Crash-safe file (WAL) store (package `RaftCs.Storage.File`). |

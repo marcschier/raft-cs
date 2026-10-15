@@ -14,6 +14,7 @@ public sealed class MemoryStorage : IRaftSnapshotStorage
     private readonly List<Entry> _entries = new() { default };
     private HardState _hardState;
     private SnapshotMetadata _snapshotMetadata;
+    private ulong _confStateIndex;
     private Snapshot? _snapshot;
 
     /// <summary>Initializes a new instance of the <see cref="MemoryStorage"/> class with no initial members.</summary>
@@ -48,9 +49,8 @@ public sealed class MemoryStorage : IRaftSnapshotStorage
         }
     }
 
-    /// <summary>Overwrites the persisted committed configuration.</summary>
-    /// <param name="confState">The configuration to store.</param>
-    public void SetConfState(ConfState confState)
+    /// <inheritdoc/>
+    public void SetConfState(ConfState confState, ulong index)
     {
         lock (_gate)
         {
@@ -58,6 +58,16 @@ public sealed class MemoryStorage : IRaftSnapshotStorage
                 _snapshotMetadata.Index,
                 _snapshotMetadata.Term,
                 confState ?? new ConfState());
+            _confStateIndex = index;
+        }
+    }
+
+    /// <inheritdoc/>
+    public ulong? ConfStateIndex()
+    {
+        lock (_gate)
+        {
+            return _confStateIndex;
         }
     }
 
@@ -213,6 +223,7 @@ public sealed class MemoryStorage : IRaftSnapshotStorage
             }
 
             _snapshotMetadata = snapshot.Metadata;
+            _confStateIndex = index;
             _snapshot = snapshot;
             _entries.Clear();
             _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));

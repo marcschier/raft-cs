@@ -41,13 +41,13 @@ The node's own watermarks are available for coordination: `node.CommitIndex` (co
 Every voter needs the **same initial membership**, given as a `ConfState` of node ids.
 
 - **`MemoryStorage`** takes the membership in its constructor: `new MemoryStorage(new ConfState(new ulong[] {1,2,3}))`.
-- **`FileRaftStorage`** has no `ConfState` constructor. For a *fresh* cluster, seed it once (see below); on *restart* it recovers membership, log, and hard state from disk — do not re-seed.
+- **`FileRaftStorage`** has no `ConfState` constructor. For a *fresh* cluster, seed it once at index 0 (see below); on *restart* it recovers membership, log, and hard state from disk — do not re-seed.
 
 ```csharp
 using var storage = new FileRaftStorage(new FileRaftStorageOptions("/var/lib/raft/node1"));
 if (storage.InitialState().ConfState.Voters.Count == 0)
 {
-    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 }));
+    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 }), 0);
 }
 
 await using var node = new RaftNode(config, storage, transport);

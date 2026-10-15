@@ -94,7 +94,6 @@ public sealed class RaftNode : IAsyncDisposable
         if (restored is not null)
         {
             _committed.Writer.TryWrite(CommittedItem.ForSnapshot(restored));
-            _confHistory.Add(new KeyValuePair<ulong, ConfState>(restored.Metadata.Index, _confState));
         }
 
         int capacity = _options.StateObservationCapacity;
@@ -112,14 +111,14 @@ public sealed class RaftNode : IAsyncDisposable
         _stateChanges = Channel.CreateBounded<RaftStateChange>(observationOptions);
         _confChanges = Channel.CreateBounded<ConfState>(observationOptions);
 
-        // A stored initial configuration has no index. Without a snapshot, use it only from the latest committed
-        // configuration entry (or the commit index when none remains); earlier membership cannot be reconstructed.
-        // With a snapshot, replay the committed suffix now, while the snapshot membership is installed and before
-        // inbox messages, ticks, or campaigns can observe the core.
-        ApplyCommitted(
-            replayConfigurationChanges: restored is not null,
-            persistConfiguration: false,
-            publishConfiguration: false);
+        // Replay the whole committed suffix now, before inbox messages, ticks, or campaigns can observe the core. Only
+        // the configuration changes after the recovered baseline are replayed: the ones at or before it are already
+        // reflected in the recovered membership.
+        ulong replayConfigurationChangesAfter = RecoverConfigurationBaseline(restored);
+        while (ApplyCommitted(replayConfigurationChangesAfter, publishConfiguration: false))
+        {
+            // Each pass applies one size-capped batch of the recovered entries.
+        }
 
         // Seed the committed-configuration stream and poll property with the recovered baseline membership so a
         // stream-only consumer observes the starting configuration before any change.
@@ -518,37 +517,23 @@ public sealed class RaftNode : IAsyncDisposable
         _inbox.Writer.TryWrite(new AppendComplete(write));
     }
 
-    private void ApplyCommitted(
-        bool replayConfigurationChanges = true,
-        bool persistConfiguration = true,
-        bool publishConfiguration = true)
+    /// <summary>
+    /// Applies the next batch of committed entries; returns whether there was one. Configuration changes at or before
+    /// <paramref name="replayConfigurationChangesAfter"/> are already reflected in the membership and are skipped.
+    /// </summary>
+    private bool ApplyCommitted(ulong replayConfigurationChangesAfter = 0, bool publishConfiguration = true)
     {
         IReadOnlyList<Entry> toApply = _core.NextEntriesToApply();
         if (toApply.Count == 0)
         {
-            return;
-        }
-
-        if (!replayConfigurationChanges)
-        {
-            ulong baselineIndex = _core.CommitIndex;
-            foreach (Entry entry in toApply)
-            {
-                if (entry.Type is EntryType.ConfChange or EntryType.ConfChangeV2)
-                {
-                    baselineIndex = entry.Index;
-                }
-            }
-
-            _confHistory.Clear();
-            _confHistory.Add(new KeyValuePair<ulong, ConfState>(baselineIndex, _confState));
+            return false;
         }
 
         ulong appliedTo = 0;
         List<CommittedItem>? commands = null;
         foreach (Entry entry in toApply)
         {
-            if (ApplyEntry(entry, replayConfigurationChanges, persistConfiguration, publishConfiguration) is { } command)
+            if (ApplyEntry(entry, replayConfigurationChangesAfter, publishConfiguration) is { } command)
             {
                 (commands ??= new List<CommittedItem>(toApply.Count)).Add(command);
             }
@@ -580,6 +565,8 @@ public sealed class RaftNode : IAsyncDisposable
                 },
             });
         }
+
+        return true;
     }
 
     private void HandleCompact(CompactRequest request)
@@ -677,6 +664,55 @@ public sealed class RaftNode : IAsyncDisposable
         return snapshot;
     }
 
+    /// <summary>
+    /// Records the recovered membership as the first entry of the configuration history and returns the log index up
+    /// to which it already reflects every committed configuration change, so recovery replays only the later ones.
+    /// </summary>
+    private ulong RecoverConfigurationBaseline(Snapshot? restored)
+    {
+        ulong baselineIndex;
+        ulong replayConfigurationChangesAfter;
+        if (restored is not null)
+        {
+            baselineIndex = restored.Metadata.Index;
+            replayConfigurationChangesAfter = baselineIndex;
+        }
+        else if (_storage.ConfStateIndex() is { } storedIndex)
+        {
+            baselineIndex = storedIndex;
+            replayConfigurationChangesAfter = baselineIndex;
+        }
+        else
+        {
+            // The store does not record the index of its configuration: use it only from the latest committed
+            // configuration entry (or the commit index when none remains), and replay no recovered change.
+            baselineIndex = LatestCommittedConfigurationIndex();
+            replayConfigurationChangesAfter = ulong.MaxValue;
+        }
+
+        _confHistory.Add(new KeyValuePair<ulong, ConfState>(baselineIndex, _confState));
+        return replayConfigurationChangesAfter;
+    }
+
+    private ulong LatestCommittedConfigurationIndex()
+    {
+        ulong commit = _core.CommitIndex;
+        ulong first = _storage.FirstIndex();
+        if (commit >= first)
+        {
+            IReadOnlyList<Entry> committed = _storage.Entries(first, commit + 1, ulong.MaxValue);
+            for (int i = committed.Count - 1; i >= 0; i--)
+            {
+                if (committed[i].Type is EntryType.ConfChange or EntryType.ConfChangeV2)
+                {
+                    return committed[i].Index;
+                }
+            }
+        }
+
+        return commit;
+    }
+
     private void DeliverInstalledSnapshot(Snapshot snapshot)
     {
         ConfState confState = snapshot.Metadata.ConfState;
@@ -689,11 +725,7 @@ public sealed class RaftNode : IAsyncDisposable
     }
 
     /// <summary>Applies one committed entry; returns the item to queue for a non-empty command.</summary>
-    private CommittedItem? ApplyEntry(
-        Entry entry,
-        bool replayConfigurationChanges,
-        bool persistConfiguration,
-        bool publishConfiguration)
+    private CommittedItem? ApplyEntry(Entry entry, ulong replayConfigurationChangesAfter, bool publishConfiguration)
     {
         switch (entry.Type)
         {
@@ -707,7 +739,7 @@ public sealed class RaftNode : IAsyncDisposable
 
             case EntryType.ConfChange:
             case EntryType.ConfChangeV2:
-                if (!replayConfigurationChanges)
+                if (entry.Index <= replayConfigurationChangesAfter)
                 {
                     break;
                 }
@@ -717,10 +749,7 @@ public sealed class RaftNode : IAsyncDisposable
                 _confState = next;
                 _confHistory.Add(new KeyValuePair<ulong, ConfState>(entry.Index, next));
                 _core.ApplyConfChange(next);
-                if (persistConfiguration)
-                {
-                    _storage.SetConfState(next);
-                }
+                _storage.SetConfState(next, entry.Index);
 
                 // Surface the committed membership so consumers can reconcile against it.
                 if (publishConfiguration)

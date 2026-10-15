@@ -81,6 +81,20 @@ public sealed class MemoryStorageTests
         (HardState hardState, ConfState restored) = storage.InitialState();
         await Assert.That(hardState.Commit).IsEqualTo((ulong)5);
         await Assert.That(string.Join(",", restored.Voters)).IsEqualTo("1,2,3");
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)5);
+    }
+
+    [Test]
+    public async Task SetConfState_RecordsTheIndexItReflects()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)0);
+
+        var confState = new ConfState(new ulong[] { 1, 2 });
+        storage.SetConfState(confState, 4);
+
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)4);
+        await Assert.That(storage.InitialState().ConfState.Equals(confState)).IsTrue();
     }
 
     [Test]

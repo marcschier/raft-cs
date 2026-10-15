@@ -1,5 +1,7 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
+using System.Buffers.Binary;
+
 namespace Raft.Storage.File.Tests;
 
 public sealed class FileRaftStorageTests
@@ -44,7 +46,7 @@ public sealed class FileRaftStorageTests
             {
                 storage.Append(entries);
                 storage.SetHardState(hardState);
-                storage.SetConfState(confState);
+                storage.SetConfState(confState, 2);
             }
 
             using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
@@ -52,6 +54,7 @@ public sealed class FileRaftStorageTests
                 (HardState loadedHardState, Configuration.ConfState loadedConfState) = reopened.InitialState();
                 await Assert.That(loadedHardState).IsEqualTo(hardState);
                 await Assert.That(loadedConfState.Equals(confState)).IsTrue();
+                await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)2);
                 await Assert.That(reopened.FirstIndex()).IsEqualTo(1UL);
                 await Assert.That(reopened.LastIndex()).IsEqualTo(3UL);
                 await AssertEntriesEqual(reopened.Entries(1, 4, ulong.MaxValue), entries);
@@ -145,7 +148,7 @@ public sealed class FileRaftStorageTests
             {
                 storage.Append(CreateEntries(1, 4));
                 storage.CreateSnapshot(2, snapshotConfState, new byte[] { 2 });
-                storage.SetConfState(currentConfState);
+                storage.SetConfState(currentConfState, 3);
             }
 
             using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
@@ -171,12 +174,100 @@ public sealed class FileRaftStorageTests
             using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
             storage.Append(CreateEntries(1, 2));
             storage.SetHardState(new HardState(2, 1, 2));
-            storage.SetConfState(confState);
+            storage.SetConfState(confState, 2);
 
             Snapshot fallback = storage.Snapshot(2);
 
             await Assert.That(fallback.Data.IsEmpty).IsTrue();
             await Assert.That(fallback.Metadata.ConfState.Equals(confState)).IsTrue();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task ConfStateIndex_FollowsSetConfStateAndSnapshots_AndSurvivesReopen()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var snapshotConfState = new Configuration.ConfState(TwoVoters);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)0);
+                storage.Append(CreateEntries(1, 4));
+                storage.SetConfState(new Configuration.ConfState(OneVoter), 3);
+                await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)3);
+            }
+
+            using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)3);
+                reopened.ApplySnapshot(new Snapshot(new SnapshotMetadata(6, 6, snapshotConfState), new byte[] { 6 }));
+                await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)6);
+            }
+
+            using var afterSnapshot = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(afterSnapshot.ConfStateIndex()).IsEqualTo((ulong?)6);
+            await Assert.That(afterSnapshot.InitialState().ConfState.Equals(snapshotConfState)).IsTrue();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task ConfStateRecordWithoutIndex_ReopensWithAnUnknownIndex()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            // A configuration record as written before the index was recorded: voters { 1 }, no learners.
+            byte[] payload = new byte[1 + 1 + 4 + 8 + 4 + 4 + 4];
+            payload[0] = 4;
+            BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(2), 1);
+            BinaryPrimitives.WriteUInt64BigEndian(payload.AsSpan(6), 1);
+            byte[] record = new byte[4 + payload.Length];
+            BinaryPrimitives.WriteInt32BigEndian(record, payload.Length);
+            payload.CopyTo(record, 4);
+            System.IO.File.WriteAllBytes(Path.Combine(directory, "log"), record);
+
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(storage.InitialState().ConfState.Voters.SequenceEqual(OneVoter)).IsTrue();
+            await Assert.That(storage.ConfStateIndex()).IsNull();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task TornConfStateRecord_KeepsThePreviousConfigurationAndIndex()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var bootstrap = new Configuration.ConfState(TwoVoters);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.SetConfState(bootstrap, 0);
+                storage.SetConfState(new Configuration.ConfState(OneVoter), 5);
+            }
+
+            // The process stopped while the configuration after the index record was being written.
+            string logPath = Path.Combine(directory, "log");
+            using (var log = new FileStream(logPath, FileMode.Open, FileAccess.Write))
+            {
+                log.SetLength(log.Length - 1);
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.InitialState().ConfState.Equals(bootstrap)).IsTrue();
+            await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)0);
         }
         finally
         {
@@ -499,6 +590,7 @@ public sealed class FileRaftStorageTests
         (HardState actualHardState, Configuration.ConfState actualConfState) = actual.InitialState();
         await Assert.That(actualHardState).IsEqualTo(expectedHardState);
         await Assert.That(actualConfState.Equals(expectedConfState)).IsTrue();
+        await Assert.That(actual.ConfStateIndex()).IsEqualTo(expected.ConfStateIndex());
         await Assert.That(actual.FirstIndex()).IsEqualTo(expected.FirstIndex());
         await Assert.That(actual.LastIndex()).IsEqualTo(expected.LastIndex());
 
