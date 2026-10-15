@@ -36,6 +36,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private readonly bool _fsync;
     private readonly Action<string> _syncDirectory;
     private readonly StatxCall? _statx;
+    private readonly AccessControlCopy? _accessControl;
     private readonly List<Entry> _entries = new() { default };
     private FileStream _logStream;
     private HardState _hardState;
@@ -52,7 +53,11 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     {
     }
 
-    internal FileRaftStorage(FileRaftStorageOptions options, Action<string> syncDirectory, StatxCall? statx = null)
+    internal FileRaftStorage(
+        FileRaftStorageOptions options,
+        Action<string> syncDirectory,
+        StatxCall? statx = null,
+        AccessControlCopy? accessControl = null)
     {
         ThrowIfNull(options);
         ThrowIfNull(syncDirectory);
@@ -61,6 +66,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         _fsync = options.Fsync;
         _syncDirectory = syncDirectory;
         _statx = statx;
+        _accessControl = accessControl;
         _logPath = Path.Combine(options.DirectoryPath, LogFileName);
         _compactingLogPath = Path.Combine(options.DirectoryPath, CompactingLogFileName);
         _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
@@ -321,9 +327,11 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     }
 
     /// <summary>
-    /// Compacts the log up to (and excluding) <paramref name="compactIndex"/> and rewrites the log file so it holds
-    /// only the retained entries. The compacted log is written next to the log and then replaces it, so after a crash
-    /// either the former or the compacted log is in place, and both describe the retained entries.
+    /// Compacts the log up to (and excluding) <paramref name="compactIndex"/>. When the log file's owner, group, and
+    /// access control can be reproduced exactly on a new file, the log file is rewritten so it holds only the retained
+    /// entries: the compacted log is written next to the log and then replaces it, so after a crash either the former
+    /// or the compacted log is in place, and both describe the retained entries. Otherwise the compaction is recorded
+    /// in the log file, which keeps its access and does not shrink.
     /// </summary>
     /// <param name="compactIndex">The first index to retain.</param>
     public void Compact(ulong compactIndex)
@@ -332,9 +340,20 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         {
             ThrowIfDisposed();
             EnsureLogWritable();
-            RewriteLog(CreateCompactedEntries(compactIndex));
+            List<Entry> compactedEntries = CreateCompactedEntries(compactIndex);
+            if (!TryRewriteLog(compactedEntries))
+            {
+                WriteCompactRecord(_logStream, compactIndex);
+                FlushLog();
+                _entries.Clear();
+                _entries.AddRange(compactedEntries);
+                SkippedLogRewrites++;
+            }
         }
     }
+
+    /// <summary>Gets the number of compactions recorded in the log file because it could not be rewritten.</summary>
+    internal int SkippedLogRewrites { get; private set; }
 
     /// <summary>Overwrites the persisted hard state.</summary>
     /// <param name="hardState">The hard state to store.</param>
@@ -754,9 +773,16 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     /// Replaces the log file with one that holds only the retained log: the compaction boundary, the entries after it,
     /// and the hard state.
     /// </summary>
-    private void RewriteLog(List<Entry> compactedEntries)
+    /// <returns>Whether the log file was replaced; not when its access cannot be reproduced on a new file.</returns>
+    private bool TryRewriteLog(List<Entry> compactedEntries)
     {
-        using (FileStream compacted = CreateCompactingLog())
+        FileStream? staged = CreateCompactingLog();
+        if (staged is null)
+        {
+            return false;
+        }
+
+        using (FileStream compacted = staged)
         {
             WriteBaseRecord(compacted, compactedEntries[0]);
             WriteLegacyReaderRejectionRecord(compacted);
@@ -766,18 +792,6 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             }
 
             WriteHardStateRecord(compacted, _hardState);
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                // Every payload is written while the compacted log is owner-only; only then does it get the log's
-                // access, before the sync and the replacement publish it.
-                compacted.Flush();
-                UnixStagedLog.ApplyLogAccess(
-                    _logStream.SafeFileHandle,
-                    compacted.SafeFileHandle,
-                    _compactingLogPath,
-                    _statx);
-            }
-
             compacted.Flush(_fsync);
         }
 
@@ -825,15 +839,17 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 "The compacted log was replaced but could not be reopened for writes.",
                 reopenException);
         }
+
+        return true;
     }
 
     /// <summary>
-    /// Creates an empty compacted log whose access is never broader than the log's: on Windows the file is created
-    /// with the log's access rules, and on Unix it is created exclusively and owner-only and gets the log's access
-    /// only after the retained payloads are written, so they are never exposed and the replaced log keeps its access
-    /// restrictions.
+    /// Creates an empty compacted log with exactly the log's access, which is never broader than the log's while it is
+    /// created: on Windows the file is created with the log's access rules, and on Unix it is created exclusively and
+    /// owner-only and then gets the log's owner, group, access control list, and mode before any payload.
     /// </summary>
-    private FileStream CreateCompactingLog()
+    /// <returns>The compacted log; <see langword="null"/> when the log's access cannot be reproduced exactly.</returns>
+    private FileStream? CreateCompactingLog()
     {
         // A file that already exists keeps its own permissions when reopened, so the compacted log is always created.
         System.IO.File.Delete(_compactingLogPath);
@@ -842,7 +858,26 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             return CreateCompactingLogOnWindows();
         }
 
-        return UnixStagedLog.Create(_compactingLogPath);
+        FileStream staged = UnixStagedLog.Create(_compactingLogPath);
+        bool hasLogAccess = false;
+        try
+        {
+            hasLogAccess = UnixStagedLog.TryApplyLogAccess(
+                _logStream.SafeFileHandle,
+                staged.SafeFileHandle,
+                _statx,
+                _accessControl);
+        }
+        finally
+        {
+            if (!hasLogAccess)
+            {
+                staged.Dispose();
+                System.IO.File.Delete(_compactingLogPath);
+            }
+        }
+
+        return hasLogAccess ? staged : null;
     }
 
     /// <summary>
@@ -868,9 +903,15 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     {
         // Older readers ignore BaseRecord. They interpret this otherwise-invalid compaction index as an error rather
         // than replaying retained entries with incorrect indexes.
+        WriteCompactRecord(stream, 0);
+    }
+
+    private static void WriteCompactRecord(Stream stream, ulong compactIndex)
+    {
         Span<byte> payload = stackalloc byte[1 + UInt64Size];
         payload[0] = CompactRecord;
-        payload.Slice(1).Clear();
+        int offset = 1;
+        WriteUInt64(payload, ref offset, compactIndex);
         WriteRecord(stream, payload);
     }
 

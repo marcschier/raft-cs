@@ -1,6 +1,5 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
-using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 #if NET8_0_OR_GREATER
 using System.Runtime.Versioning;
@@ -16,28 +15,33 @@ namespace Raft.Storage.File;
 /// <returns>0 on success; otherwise the errno of the failure.</returns>
 internal delegate int StatxCall(int descriptor, Span<byte> buffer);
 
+/// <summary>Gives the staged log the log's access control list, or confirms that neither file has one.</summary>
+/// <param name="log">The log's descriptor.</param>
+/// <param name="staged">The staged log's descriptor.</param>
+/// <returns>Whether the staged log's access control list is now the log's.</returns>
+internal delegate bool AccessControlCopy(int log, int staged);
+
 /// <summary>The owner, group, and mode of an open file.</summary>
 internal readonly record struct UnixFileStatus(uint Uid, uint Gid, uint Mode);
 
 /// <summary>
-/// Creates the compacted log on Unix and gives it the log's access controls before it replaces the log.
+/// Creates the compacted log on Unix and gives it the log's access exactly, or reports that it cannot.
 /// </summary>
 /// <remarks>
 /// <para>
 /// The compacted log is created exclusively and owner-only, and the returned stream writes through the descriptor that
-/// created it, so no file or symbolic link placed at the path is opened and no other user can open the new file. The
-/// retained payloads are written while the file is owner-only; <see cref="ApplyLogAccess"/> then applies the log's
-/// owner and group, access control list, and permission bits, in that order, so no step grants anyone access the log
-/// does not grant. When the process may not assign the log's group, the compacted log withholds the group's access,
-/// and the other class, which the log's group members then fall into, keeps only what that group was granted. The
-/// owner the process may not assign stays the process, which already reads and writes the log.
+/// created it, so no file or symbolic link placed at the path is opened and no other user can open the new file.
+/// Before any payload is written, <see cref="TryApplyLogAccess"/> reproduces the log's access on it: the owner must
+/// already be the log's (it is never changed), the group is set to the log's, the access control list is copied, and
+/// the mode is set; then the result is read back and compared. Each step leaves the file no more accessible than the
+/// log. When any of them cannot be done exactly the log is not rewritten.
 /// </para>
 /// <para>
-/// Linux copies the POSIX access control list too; other Unix systems copy the owner, group, and permission bits but
-/// not extended ACLs. The owner, group, and mode are read with statx on Linux. Where libc lacks statx (glibc before
-/// 2.28, musl before 1.2.5) or the kernel refuses it (ENOSYS, or EPERM from a seccomp filter), and on other Unix
-/// systems, they are read with the runtime's own fstat, whose result the runtime lays out identically for every libc
-/// and architecture, rather than with a hand-laid struct stat.
+/// Linux copies the POSIX access control list; macOS rewrites only a log that has no extended ACL, and a staged log
+/// that inherited none; other Unix systems, whose ACLs are not inspected, never rewrite the log. The owner, group, and
+/// mode are read with statx on Linux. Where libc lacks statx (glibc before 2.28, musl before 1.2.5) or the kernel
+/// refuses it (ENOSYS, or EPERM from a seccomp filter), and on other Unix systems, they are read with the runtime's
+/// own fstat, whose result the runtime lays out identically for every libc and architecture.
 /// </para>
 /// </remarks>
 #if NET8_0_OR_GREATER
@@ -46,18 +50,8 @@ internal readonly record struct UnixFileStatus(uint Uid, uint Gid, uint Mode);
 internal static unsafe class UnixStagedLog
 {
     private const int OwnerReadWrite = 0x180;
-    private const uint PermissionBits = 0x1FF;
-    private const uint GroupAndOtherBits = 0x3F;
-    private const uint GroupBits = 0x38;
-    private const uint OtherBits = 0x7;
-    private const int NotPermitted = 1;
+    private const uint FileModeBits = 0xFFF;
     private const string AccessAclName = "system.posix_acl_access";
-    private const int AclHeaderSize = 4;
-    private const int AclEntrySize = 8;
-    private const int AclVersion = 2;
-    private const ushort AclGroupObject = 0x04;
-    private const ushort AclMask = 0x10;
-    private const ushort AclOther = 0x20;
 
     private const int LinuxWriteOnly = 0x1;
     private const int LinuxCreate = 0x40;
@@ -69,10 +63,16 @@ internal static unsafe class UnixStagedLog
     private const int LinuxStatxUidOffset = 20;
     private const int LinuxStatxGidOffset = 24;
     private const int LinuxStatxModeOffset = 28;
+    private const int LinuxNotPermitted = 1;
     private const int LinuxRange = 34;
     private const int LinuxNotImplemented = 38;
     private const int LinuxNoData = 61;
     private const int LinuxNotSupported = 95;
+
+    private const int MacNoEntry = 2;
+    private const int MacInvalid = 22;
+    private const int MacAclTypeExtended = 0x100;
+    private const int MacAclFirstEntry = 0;
 
     // The runtime's FileStatus starts with int Flags, int Mode, uint Uid, uint Gid; the buffer leaves room for the
     // rest.
@@ -80,6 +80,8 @@ internal static unsafe class UnixStagedLog
     private const int RuntimeStatusModeOffset = 4;
     private const int RuntimeStatusUidOffset = 8;
     private const int RuntimeStatusGidOffset = 12;
+
+    private static readonly byte[] AccessAclNameBytes = NullTerminated(AccessAclName);
 
     /// <summary>Creates an empty owner-only compacted log at <paramref name="path"/>, which must not exist.</summary>
     /// <param name="path">The path of the compacted log.</param>
@@ -108,13 +110,18 @@ internal static unsafe class UnixStagedLog
     }
 
     /// <summary>
-    /// Gives the compacted log the log's owner and group, access control list, and permission bits.
+    /// Gives the empty compacted log exactly the log's owner, group, access control list, and mode.
     /// </summary>
     /// <param name="log">The open log.</param>
-    /// <param name="staged">The open compacted log.</param>
-    /// <param name="stagedPath">The path of the compacted log, for error messages.</param>
+    /// <param name="staged">The open, empty compacted log.</param>
     /// <param name="statx">The statx call on Linux; <see langword="null"/> calls libc.</param>
-    public static void ApplyLogAccess(SafeFileHandle log, SafeFileHandle staged, string stagedPath, StatxCall? statx)
+    /// <param name="accessControl">The access control list step; <see langword="null"/> uses the platform's.</param>
+    /// <returns>Whether the compacted log now has exactly the log's access.</returns>
+    public static bool TryApplyLogAccess(
+        SafeFileHandle log,
+        SafeFileHandle staged,
+        StatxCall? statx,
+        AccessControlCopy? accessControl)
     {
         bool logAdded = false;
         bool stagedAdded = false;
@@ -122,11 +129,11 @@ internal static unsafe class UnixStagedLog
         {
             log.DangerousAddRef(ref logAdded);
             staged.DangerousAddRef(ref stagedAdded);
-            ApplyDescriptorAccess(
+            return TryApplyDescriptorAccess(
                 (int)log.DangerousGetHandle(),
                 (int)staged.DangerousGetHandle(),
-                stagedPath,
-                statx ?? NativeStatx);
+                statx ?? NativeStatx,
+                accessControl ?? PlatformAccessControl());
         }
         finally
         {
@@ -153,7 +160,12 @@ internal static unsafe class UnixStagedLog
         try
         {
             file.DangerousAddRef(ref added);
-            return ReadDescriptorStatus((int)file.DangerousGetHandle(), statx ?? NativeStatx, path);
+            if (!TryReadStatus((int)file.DangerousGetHandle(), statx ?? NativeStatx, out UnixFileStatus status))
+            {
+                throw new IOException($"The owner, group, and mode of '{path}' could not be read.");
+            }
+
+            return status;
         }
         finally
         {
@@ -165,150 +177,166 @@ internal static unsafe class UnixStagedLog
     }
 
     /// <summary>
-    /// Withholds the access of the log's group from a compacted log that cannot have that group: the owning group's
-    /// access is removed, and the other class, which the log's group members fall into, keeps only what the log's
-    /// group was granted.
+    /// Creates the access control list step of a platform whose extended ACLs are not copied: it succeeds only when
+    /// neither file has one.
     /// </summary>
-    /// <param name="acl">
-    /// The log's access control list, updated in place; <see langword="null"/> when it has none.
+    /// <param name="hasExtendedAcl">
+    /// Reports whether a descriptor's file has an extended ACL; <see langword="null"/> when that cannot be told.
     /// </param>
-    /// <param name="mode">The log's permission bits.</param>
-    /// <param name="stagedPath">The path of the compacted log, for error messages.</param>
-    /// <returns>The permission bits for the compacted log.</returns>
-    public static uint WithholdLogGroupAccess(byte[]? acl, uint mode, string stagedPath)
+    /// <returns>The access control list step.</returns>
+    public static AccessControlCopy RequireNoExtendedAcl(Func<int, bool?> hasExtendedAcl)
     {
-        if (acl is null)
-        {
-            uint groupAccess = (mode & GroupBits) >> 3;
-            return (mode & ~GroupAndOtherBits) | (mode & OtherBits & groupAccess);
-        }
-
-        if (acl.Length < AclHeaderSize
-            || (acl.Length - AclHeaderSize) % AclEntrySize != 0
-            || BinaryPrimitives.ReadInt32LittleEndian(acl) != AclVersion)
-        {
-            throw InvalidAcl(stagedPath);
-        }
-
-        int groupOffset = -1;
-        int otherOffset = -1;
-        bool hasMask = false;
-        for (int offset = AclHeaderSize; offset < acl.Length; offset += AclEntrySize)
-        {
-            switch (BinaryPrimitives.ReadUInt16LittleEndian(acl.AsSpan(offset)))
-            {
-                case AclGroupObject:
-                    groupOffset = offset + 2;
-                    break;
-                case AclOther:
-                    otherOffset = offset + 2;
-                    break;
-                case AclMask:
-                    hasMask = true;
-                    break;
-            }
-        }
-
-        if (groupOffset < 0 || otherOffset < 0)
-        {
-            throw InvalidAcl(stagedPath);
-        }
-
-        ushort groupPermissions = BinaryPrimitives.ReadUInt16LittleEndian(acl.AsSpan(groupOffset));
-        ushort otherPermissions = (ushort)(BinaryPrimitives.ReadUInt16LittleEndian(acl.AsSpan(otherOffset))
-            & groupPermissions);
-        BinaryPrimitives.WriteUInt16LittleEndian(acl.AsSpan(groupOffset), 0);
-        BinaryPrimitives.WriteUInt16LittleEndian(acl.AsSpan(otherOffset), otherPermissions);
-
-        // With a mask the group bits are the mask, which still bounds the named entries.
-        uint groupBits = hasMask ? mode & GroupBits : 0;
-        return (mode & ~GroupAndOtherBits) | groupBits | otherPermissions;
+        return (log, staged) => hasExtendedAcl(log) == false && hasExtendedAcl(staged) == false;
     }
 
-    private static void ApplyDescriptorAccess(int log, int staged, string stagedPath, StatxCall statx)
+    private static bool TryApplyDescriptorAccess(
+        int log,
+        int staged,
+        StatxCall statx,
+        AccessControlCopy accessControl)
     {
-        UnixFileStatus logStatus = ReadDescriptorStatus(log, statx, stagedPath);
-        UnixFileStatus stagedStatus = ReadDescriptorStatus(staged, statx, stagedPath);
-        bool isLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
-
-        // The compacted log is owner-only until the access control list and the permission bits are applied, so the
-        // owner and group change before they do.
-        bool hasLogGroup = TryAssignOwnership(staged, logStatus, stagedStatus, stagedPath);
-        byte[]? acl = isLinux ? GetAccessAcl(log, stagedPath) : null;
-        uint mode = logStatus.Mode & PermissionBits;
-        if (!hasLogGroup)
+        if (!TryReadStatus(log, statx, out UnixFileStatus logStatus)
+            || !TryReadStatus(staged, statx, out UnixFileStatus stagedStatus)
+            || stagedStatus.Uid != logStatus.Uid)
         {
-            mode = WithholdLogGroupAccess(acl, mode, stagedPath);
+            return false;
         }
 
-        if (isLinux)
+        // The group changes while the file is owner-only and before the access control list, whose owning-group entry
+        // then applies to the log's group.
+        if (stagedStatus.Gid != logStatus.Gid && ChangeOwner(staged, uint.MaxValue, logStatus.Gid) != 0)
+        {
+            return false;
+        }
+
+        uint mode = logStatus.Mode & FileModeBits;
+        if (!accessControl(log, staged) || ChangeMode(staged, mode) != 0)
+        {
+            return false;
+        }
+
+        return TryReadStatus(staged, statx, out UnixFileStatus applied)
+            && applied.Uid == logStatus.Uid
+            && applied.Gid == logStatus.Gid
+            && (applied.Mode & FileModeBits) == mode
+            && (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux) || HasSamePosixAcl(log, staged));
+    }
+
+    private static AccessControlCopy PlatformAccessControl()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            return CopyPosixAcl;
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return RequireNoExtendedAcl(MacHasExtendedAcl);
+        }
+
+        return static (_, _) => false;
+    }
+
+    private static bool CopyPosixAcl(int log, int staged)
+    {
+        if (!TryGetPosixAcl(log, out byte[]? acl))
+        {
+            return false;
+        }
+
+        fixed (byte* name = AccessAclNameBytes)
         {
             if (acl is null)
             {
-                RemoveAccessAcl(staged, stagedPath);
+                return LinuxRemoveAttribute(staged, name) == 0 || IsWithoutAcl(Marshal.GetLastWin32Error());
             }
-            else
+
+            fixed (byte* value = acl)
             {
-                SetAccessAcl(staged, acl, stagedPath);
+                return LinuxSetAttribute(staged, name, value, (nuint)acl.Length, 0) == 0;
             }
         }
-
-        // With an access control list the group bits are its mask, which the list just set to the same value.
-        if (ChangeMode(staged, mode) != 0)
-        {
-            throw CreateIOException("set the permissions of", stagedPath, Marshal.GetLastWin32Error());
-        }
     }
 
-    private static bool TryAssignOwnership(
-        int staged,
-        UnixFileStatus log,
-        UnixFileStatus stagedStatus,
-        string stagedPath)
+    private static bool HasSamePosixAcl(int log, int staged)
     {
-        if (stagedStatus.Uid == log.Uid && stagedStatus.Gid == log.Gid)
-        {
-            return true;
-        }
-
-        if (ChangeOwner(staged, log.Uid, log.Gid) == 0)
-        {
-            return true;
-        }
-
-        int error = Marshal.GetLastWin32Error();
-        if (error != NotPermitted)
-        {
-            throw CreateIOException("set the owner of", stagedPath, error);
-        }
-
-        // The process cannot give the file away; it keeps the owner, which already reads and writes the log.
-        if (stagedStatus.Gid == log.Gid)
-        {
-            return true;
-        }
-
-        if (ChangeOwner(staged, uint.MaxValue, log.Gid) == 0)
-        {
-            return true;
-        }
-
-        error = Marshal.GetLastWin32Error();
-        if (error != NotPermitted)
-        {
-            throw CreateIOException("set the group of", stagedPath, error);
-        }
-
-        return false;
+        return TryGetPosixAcl(log, out byte[]? logAcl)
+            && TryGetPosixAcl(staged, out byte[]? stagedAcl)
+            && (logAcl is null
+                ? stagedAcl is null
+                : stagedAcl is not null && logAcl.AsSpan().SequenceEqual(stagedAcl));
     }
 
-    private static UnixFileStatus ReadDescriptorStatus(int descriptor, StatxCall statx, string stagedPath)
+    private static bool TryGetPosixAcl(int descriptor, out byte[]? acl)
+    {
+        acl = null;
+        fixed (byte* name = AccessAclNameBytes)
+        {
+            while (true)
+            {
+                nint size = LinuxGetAttribute(descriptor, name, null, 0);
+                if (size < 0)
+                {
+                    return IsWithoutAcl(Marshal.GetLastWin32Error());
+                }
+
+                byte[] value = new byte[(int)size];
+                fixed (byte* valueBytes = value)
+                {
+                    nint read = LinuxGetAttribute(descriptor, name, valueBytes, (nuint)value.Length);
+                    if (read >= 0)
+                    {
+                        acl = value.AsSpan(0, (int)read).ToArray();
+                        return true;
+                    }
+                }
+
+                int error = Marshal.GetLastWin32Error();
+                if (error != LinuxRange)
+                {
+                    return IsWithoutAcl(error);
+                }
+            }
+        }
+    }
+
+    private static bool IsWithoutAcl(int error)
+    {
+        return error is LinuxNoData or LinuxNotSupported;
+    }
+
+    private static bool? MacHasExtendedAcl(int descriptor)
+    {
+        nint acl = MacGetAcl(descriptor, MacAclTypeExtended);
+        if (acl == 0)
+        {
+            return Marshal.GetLastWin32Error() == MacNoEntry ? false : null;
+        }
+
+        try
+        {
+            nint entry;
+            if (MacGetAclEntry(acl, MacAclFirstEntry, &entry) == 0)
+            {
+                return true;
+            }
+
+            return Marshal.GetLastWin32Error() == MacInvalid ? false : null;
+        }
+        finally
+        {
+            _ = MacFreeAcl(acl);
+        }
+    }
+
+    private static bool TryReadStatus(int descriptor, StatxCall statx, out UnixFileStatus status)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            return ReadRuntimeStatus(descriptor, stagedPath);
+            return TryReadRuntimeStatus(descriptor, out status);
         }
 
+        status = default;
         Span<byte> buffer = stackalloc byte[LinuxStatxSize];
         int error;
         try
@@ -318,29 +346,25 @@ internal static unsafe class UnixStagedLog
         catch (EntryPointNotFoundException)
         {
             // libc predates statx (glibc 2.28, musl 1.2.5).
-            return ReadRuntimeStatus(descriptor, stagedPath);
+            return TryReadRuntimeStatus(descriptor, out status);
         }
 
-        if (error is LinuxNotImplemented or NotPermitted)
+        if (error is LinuxNotImplemented or LinuxNotPermitted)
         {
             // The kernel predates statx, or a seccomp filter refuses it; reading an open descriptor needs no access.
-            return ReadRuntimeStatus(descriptor, stagedPath);
+            return TryReadRuntimeStatus(descriptor, out status);
         }
 
-        if (error != 0)
+        if (error != 0 || (MemoryMarshal.Read<uint>(buffer) & LinuxStatxRequired) != LinuxStatxRequired)
         {
-            throw CreateIOException("read the access of the log for", stagedPath, error);
+            return false;
         }
 
-        if ((MemoryMarshal.Read<uint>(buffer) & LinuxStatxRequired) != LinuxStatxRequired)
-        {
-            throw new IOException($"The log's owner and permissions could not be read for '{stagedPath}'.");
-        }
-
-        return new UnixFileStatus(
+        status = new UnixFileStatus(
             MemoryMarshal.Read<uint>(buffer.Slice(LinuxStatxUidOffset)),
             MemoryMarshal.Read<uint>(buffer.Slice(LinuxStatxGidOffset)),
             MemoryMarshal.Read<ushort>(buffer.Slice(LinuxStatxModeOffset)));
+        return true;
     }
 
     private static int NativeStatx(int descriptor, Span<byte> buffer)
@@ -354,18 +378,20 @@ internal static unsafe class UnixStagedLog
         }
     }
 
-    private static UnixFileStatus ReadRuntimeStatus(int descriptor, string stagedPath)
+    private static bool TryReadRuntimeStatus(int descriptor, out UnixFileStatus status)
     {
-        byte* status = stackalloc byte[RuntimeStatusSize];
-        if (RuntimeFileStatus(descriptor, status) != 0)
+        byte* buffer = stackalloc byte[RuntimeStatusSize];
+        if (RuntimeFileStatus(descriptor, buffer) != 0)
         {
-            throw CreateIOException("read the access of the log for", stagedPath, Marshal.GetLastWin32Error());
+            status = default;
+            return false;
         }
 
-        return new UnixFileStatus(
-            *(uint*)(status + RuntimeStatusUidOffset),
-            *(uint*)(status + RuntimeStatusGidOffset),
-            *(uint*)(status + RuntimeStatusModeOffset));
+        status = new UnixFileStatus(
+            *(uint*)(buffer + RuntimeStatusUidOffset),
+            *(uint*)(buffer + RuntimeStatusGidOffset),
+            *(uint*)(buffer + RuntimeStatusModeOffset));
+        return true;
     }
 
     private static int ChangeOwner(int descriptor, uint owner, uint group)
@@ -468,81 +494,6 @@ internal static unsafe class UnixStagedLog
         }
     }
 
-    private static byte[]? GetAccessAcl(int descriptor, string stagedPath)
-    {
-        fixed (byte* name = NullTerminated(AccessAclName))
-        {
-            while (true)
-            {
-                nint size = LinuxGetAttribute(descriptor, name, null, 0);
-                if (size < 0)
-                {
-                    return NoAclOrThrow(Marshal.GetLastWin32Error(), stagedPath);
-                }
-
-                byte[] value = new byte[(int)size];
-                fixed (byte* valueBytes = value)
-                {
-                    nint read = LinuxGetAttribute(descriptor, name, valueBytes, (nuint)value.Length);
-                    if (read >= 0)
-                    {
-                        return value.AsSpan(0, (int)read).ToArray();
-                    }
-                }
-
-                int error = Marshal.GetLastWin32Error();
-                if (error != LinuxRange)
-                {
-                    return NoAclOrThrow(error, stagedPath);
-                }
-            }
-        }
-    }
-
-    private static byte[]? NoAclOrThrow(int error, string stagedPath)
-    {
-        if (error is LinuxNoData or LinuxNotSupported)
-        {
-            return null;
-        }
-
-        throw CreateIOException("read the access control list of the log for", stagedPath, error);
-    }
-
-    private static void SetAccessAcl(int descriptor, byte[] acl, string stagedPath)
-    {
-        fixed (byte* name = NullTerminated(AccessAclName))
-        fixed (byte* value = acl)
-        {
-            if (LinuxSetAttribute(descriptor, name, value, (nuint)acl.Length, 0) != 0)
-            {
-                throw CreateIOException("set the access control list of", stagedPath, Marshal.GetLastWin32Error());
-            }
-        }
-    }
-
-    private static void RemoveAccessAcl(int descriptor, string stagedPath)
-    {
-        fixed (byte* name = NullTerminated(AccessAclName))
-        {
-            if (LinuxRemoveAttribute(descriptor, name) == 0)
-            {
-                return;
-            }
-        }
-
-        int error = Marshal.GetLastWin32Error();
-        if (error is not (LinuxNoData or LinuxNotSupported))
-        {
-            throw CreateIOException("remove the access control list of", stagedPath, error);
-        }
-    }
-
-    private static IOException InvalidAcl(string stagedPath)
-    {
-        return new IOException($"The log's access control list could not be applied to '{stagedPath}'.");
-    }
-
     private static byte[] NullTerminated(string value)
     {
         byte[] bytes = new byte[Encoding.UTF8.GetByteCount(value) + 1];
@@ -584,6 +535,15 @@ internal static unsafe class UnixStagedLog
 
     [DllImport("libSystem.B.dylib", EntryPoint = "fchmod", SetLastError = true)]
     private static extern int MacChangeMode(int descriptor, ushort mode);
+
+    [DllImport("libSystem.B.dylib", EntryPoint = "acl_get_fd_np", SetLastError = true)]
+    private static extern nint MacGetAcl(int descriptor, int type);
+
+    [DllImport("libSystem.B.dylib", EntryPoint = "acl_get_entry", SetLastError = true)]
+    private static extern int MacGetAclEntry(nint acl, int entryId, nint* entry);
+
+    [DllImport("libSystem.B.dylib", EntryPoint = "acl_free", SetLastError = true)]
+    private static extern int MacFreeAcl(nint acl);
 
     // The runtime's fstat (what File.GetUnixFileMode calls), built for the process's libc and architecture.
     [DllImport("libSystem.Native", EntryPoint = "SystemNative_FStat", SetLastError = true)]

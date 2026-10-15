@@ -31,6 +31,19 @@ public sealed class FileRaftStorageTests
         Refused,
     }
 
+    public enum LogIdentity
+    {
+        OtherOwner,
+        OtherGroup,
+    }
+
+    public enum ExtendedAcl
+    {
+        Absent,
+        Present,
+        Unknown,
+    }
+
     [Test]
     public async Task RoundTrip_AppendsAndReadsEntries()
     {
@@ -434,6 +447,7 @@ public sealed class FileRaftStorageTests
 
             storage.Compact(3);
 
+            await Assert.That(storage.SkippedLogRewrites).IsEqualTo(0);
             await Assert.That(System.IO.File.GetUnixFileMode(logPath)).IsEqualTo(permissions);
             await Assert.That(System.IO.File.Exists(compactingPath)).IsFalse();
             await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
@@ -550,15 +564,16 @@ public sealed class FileRaftStorageTests
                 storage.Append(CreateEntries(1, 5));
                 if (logHasAcl)
                 {
+                    // The mask is narrower than the owning group's entry, and others may write.
                     PosixAcl.Set(
                         logPath,
                         PosixAcl.AccessName,
                         PosixAcl.Create(
                             (PosixAcl.UserObject, 6, PosixAcl.NoId),
                             (PosixAcl.User, 4, LogAclUid),
-                            (PosixAcl.GroupObject, 4, PosixAcl.NoId),
+                            (PosixAcl.GroupObject, 6, PosixAcl.NoId),
                             (PosixAcl.Mask, 4, PosixAcl.NoId),
-                            (PosixAcl.Other, 0, PosixAcl.NoId)));
+                            (PosixAcl.Other, 6, PosixAcl.NoId)));
                 }
                 else
                 {
@@ -576,6 +591,7 @@ public sealed class FileRaftStorageTests
                 storage.Compact(3);
 
                 byte[]? actualAcl = PosixAcl.Get(logPath, PosixAcl.AccessName);
+                await Assert.That(storage.SkippedLogRewrites).IsEqualTo(0);
                 await Assert.That(actualAcl is not null).IsEqualTo(logHasAcl);
                 if (expectedAcl is not null)
                 {
@@ -696,7 +712,8 @@ public sealed class FileRaftStorageTests
 
             storage.Compact(3);
 
-            await Assert.That(calls).IsEqualTo(2);
+            await Assert.That(calls).IsEqualTo(3);
+            await Assert.That(storage.SkippedLogRewrites).IsEqualTo(0);
             await Assert.That(PosixAcl.Get(logPath, PosixAcl.AccessName)!.AsSpan().SequenceEqual(expectedAcl)).IsTrue();
             await Assert.That(System.IO.File.GetUnixFileMode(logPath)).IsEqualTo(expectedMode);
             await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
@@ -708,51 +725,57 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
-    public async Task Compact_OnLinux_WithholdsTheAccessOfAGroupItCannotAssign()
+    [Arguments(LogIdentity.OtherOwner)]
+    [Arguments(LogIdentity.OtherGroup)]
+    public async Task Compact_OnLinux_KeepsTheLogFileWhenItsOwnerOrGroupCannotBeReproduced(LogIdentity identity)
     {
         if (!OperatingSystem.IsLinux())
         {
-            // The log's group is read from the injected statx result on Linux.
+            // The log's owner and group are read from the injected statx result on Linux.
             return;
         }
 
-        const uint unassignableGid = 4545;
-        var statx = new LogGroupStatx(unassignableGid);
-        string directory = CreateDirectory();
+        const uint otherId = 4545;
+        var statx = new LogIdentityStatx(
+            identity == LogIdentity.OtherOwner ? otherId : null,
+            identity == LogIdentity.OtherGroup ? otherId : null);
+        string directory = CreateDirectoryWithDefaultAcl();
         try
         {
             string logPath = Path.Combine(directory, "log");
-            using var storage = new FileRaftStorage(
+            bool canAssignAnyGroup;
+            using (var storage = new FileRaftStorage(
                 new FileRaftStorageOptions(directory) { Fsync = false },
                 _ => { },
-                statx.Call);
-            storage.Append(CreateEntries(1, 5));
-            System.IO.File.SetUnixFileMode(
-                logPath,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead
-                | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
-
-            storage.Compact(3);
-
-            UnixFileMode actual = System.IO.File.GetUnixFileMode(logPath);
-            using (var log = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                statx.Call))
             {
-                if (UnixStagedLog.ReadStatus(log.SafeFileHandle, logPath, statx: null).Gid == unassignableGid)
+                storage.Append(CreateEntries(1, 5));
+                using (FileStream log = OpenShared(logPath))
                 {
-                    // Running as root, the compacted log has the log's group and its whole access.
-                    await Assert.That(actual).IsEqualTo(
-                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead
-                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                    canAssignAnyGroup = UnixStagedLog.ReadStatus(log.SafeFileHandle, logPath, null).Uid == 0;
+                }
+
+                LogFileState before = LogFileState.Read(logPath);
+
+                storage.Compact(3);
+
+                if (identity == LogIdentity.OtherGroup && canAssignAnyGroup)
+                {
+                    // Root gives the compacted log any group, so the log is rewritten with the reported one.
+                    await Assert.That(storage.SkippedLogRewrites).IsEqualTo(0);
+                    using FileStream log = OpenShared(logPath);
+                    await Assert.That(UnixStagedLog.ReadStatus(log.SafeFileHandle, logPath, null).Gid)
+                        .IsEqualTo(otherId);
                 }
                 else
                 {
-                    // The group gets nothing, and the log's group members, now in the other class, keep only read.
-                    await Assert.That(actual).IsEqualTo(
-                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.OtherRead);
+                    await AssertCompactionRecordedInLogFile(storage, logPath, before);
                 }
             }
 
-            await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
+            await AssertEntriesEqual(reopened.Entries(4, 6, ulong.MaxValue), CreateEntries(4, 2));
         }
         finally
         {
@@ -761,46 +784,64 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
-    [Arguments(0b110_100_110u, 0b110_000_100u)]
-    [Arguments(0b110_000_110u, 0b110_000_000u)]
-    [Arguments(0b111_111_111u, 0b111_000_111u)]
-    public async Task WithholdLogGroupAccess_WithoutAcl_LimitsOthersToTheGroupAccess(uint mode, uint expected)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            // Unix permission bits only.
-            return;
-        }
-
-        await Assert.That(UnixStagedLog.WithholdLogGroupAccess(null, mode, "log.compact")).IsEqualTo(expected);
-    }
-
-    [Test]
-    public async Task WithholdLogGroupAccess_WithAcl_LimitsOthersToTheGroupEntryAndKeepsTheMask()
+    [Arguments(ExtendedAcl.Absent)]
+    [Arguments(ExtendedAcl.Present)]
+    [Arguments(ExtendedAcl.Unknown)]
+    public async Task Compact_WithoutCopiedExtendedAcls_RewritesOnlyWhenNeitherFileHasOne(ExtendedAcl extendedAcl)
     {
         if (!OperatingSystem.IsLinux())
         {
-            // POSIX access control lists are copied on Linux only.
+            // The access control list step of macOS is injected and run on Linux.
             return;
         }
 
-        byte[] acl = PosixAcl.Create(
-            (PosixAcl.UserObject, 6, PosixAcl.NoId),
-            (PosixAcl.User, 4, LogAclUid),
-            (PosixAcl.GroupObject, 4, PosixAcl.NoId),
-            (PosixAcl.Mask, 6, PosixAcl.NoId),
-            (PosixAcl.Other, 6, PosixAcl.NoId));
-        byte[] expected = PosixAcl.Create(
-            (PosixAcl.UserObject, 6, PosixAcl.NoId),
-            (PosixAcl.User, 4, LogAclUid),
-            (PosixAcl.GroupObject, 0, PosixAcl.NoId),
-            (PosixAcl.Mask, 6, PosixAcl.NoId),
-            (PosixAcl.Other, 4, PosixAcl.NoId));
+        string directory = CreateDirectory();
+        try
+        {
+            string logPath = Path.Combine(directory, "log");
+            int probes = 0;
+            AccessControlCopy macOSStep = UnixStagedLog.RequireNoExtendedAcl(_ =>
+            {
+                probes++;
+                return extendedAcl switch
+                {
+                    ExtendedAcl.Absent => false,
+                    ExtendedAcl.Present => true,
+                    _ => null,
+                };
+            });
+            using (var storage = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = false },
+                _ => { },
+                statx: null,
+                macOSStep))
+            {
+                storage.Append(CreateEntries(1, 5));
+                LogFileState before = LogFileState.Read(logPath);
 
-        uint mode = UnixStagedLog.WithholdLogGroupAccess(acl, 0b110_110_110u, "log.compact");
+                storage.Compact(3);
 
-        await Assert.That(mode).IsEqualTo(0b110_110_100u);
-        await Assert.That(acl.AsSpan().SequenceEqual(expected)).IsTrue();
+                if (extendedAcl == ExtendedAcl.Absent)
+                {
+                    await Assert.That(probes).IsEqualTo(2);
+                    await Assert.That(storage.SkippedLogRewrites).IsEqualTo(0);
+                    await Assert.That(new FileInfo(logPath).Length).IsLessThan(before.Bytes.Length);
+                }
+                else
+                {
+                    await Assert.That(probes).IsEqualTo(1);
+                    await AssertCompactionRecordedInLogFile(storage, logPath, before);
+                }
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
+            await AssertEntriesEqual(reopened.Entries(4, 6, ulong.MaxValue), CreateEntries(4, 2));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
     }
 
     [Test]
@@ -1222,12 +1263,59 @@ public sealed class FileRaftStorageTests
         }
     }
 
+    private static FileStream OpenShared(string path)
+    {
+        return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+    }
+
+    [SupportedOSPlatform("linux")]
+    private static async Task AssertCompactionRecordedInLogFile(
+        FileRaftStorage storage,
+        string logPath,
+        LogFileState before)
+    {
+        const int compactRecordLength = 4 + 1 + 8;
+        LogFileState after = LogFileState.Read(logPath);
+
+        // The log file is kept with its access, and only the compaction record is appended to it.
+        await Assert.That(storage.SkippedLogRewrites).IsEqualTo(1);
+        await Assert.That(after.Bytes.Length).IsEqualTo(before.Bytes.Length + compactRecordLength);
+        await Assert.That(after.Bytes.AsSpan(0, before.Bytes.Length).SequenceEqual(before.Bytes)).IsTrue();
+        await Assert.That(after.Mode).IsEqualTo(before.Mode);
+        await Assert.That(after.Acl is null).IsEqualTo(before.Acl is null);
+        if (before.Acl is not null)
+        {
+            await Assert.That(after.Acl!.AsSpan().SequenceEqual(before.Acl)).IsTrue();
+        }
+
+        string compactingPath = Path.Combine(Path.GetDirectoryName(logPath)!, "log.compact");
+        await Assert.That(System.IO.File.Exists(compactingPath)).IsFalse();
+        await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+        await AssertEntriesEqual(storage.Entries(4, 6, ulong.MaxValue), CreateEntries(4, 2));
+        await AssertStorageError(() => storage.Entries(3, 4, ulong.MaxValue), RaftStorageError.Compacted);
+    }
+
+    [SupportedOSPlatform("linux")]
+    private sealed record LogFileState(byte[] Bytes, UnixFileMode Mode, byte[]? Acl)
+    {
+        public static LogFileState Read(string path)
+        {
+            using FileStream log = OpenShared(path);
+            byte[] bytes = new byte[log.Length];
+            log.ReadExactly(bytes);
+            return new LogFileState(
+                bytes,
+                System.IO.File.GetUnixFileMode(path),
+                PosixAcl.Get(path, PosixAcl.AccessName));
+        }
+    }
+
     /// <summary>
-    /// Answers statx from the runtime's file status, whichever libc the test runs on, and reports a group for the log,
-    /// the first file read, that the process is not a member of.
+    /// Answers statx from the runtime's file status, whichever libc the test runs on, and reports an owner or a group
+    /// for the log, the first file read, that is not the process's.
     /// </summary>
     [SupportedOSPlatform("linux")]
-    private sealed class LogGroupStatx(uint gid)
+    private sealed class LogIdentityStatx(uint? uid, uint? gid)
     {
         private const uint ModeUidGid = 0x2 | 0x8 | 0x10;
         private const int UidOffset = 20;
@@ -1239,9 +1327,10 @@ public sealed class FileRaftStorageTests
         {
             using var file = new SafeFileHandle((IntPtr)descriptor, ownsHandle: false);
             UnixFileStatus status = UnixStagedLog.ReadStatus(file, "log", static (_, _) => StatxNotImplemented);
+            bool isLog = _calls++ == 0;
             BinaryPrimitives.WriteUInt32LittleEndian(buffer, ModeUidGid);
-            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(UidOffset), status.Uid);
-            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(GidOffset), _calls++ == 0 ? gid : status.Gid);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(UidOffset), isLog ? uid ?? status.Uid : status.Uid);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(GidOffset), isLog ? gid ?? status.Gid : status.Gid);
             BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(ModeOffset), (ushort)status.Mode);
             return 0;
         }
