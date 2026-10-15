@@ -14,6 +14,13 @@ namespace Raft.Storage;
 /// that does not implement this interface it does the same, and persists each committed configuration with
 /// <see cref="IRaftWritableStorage.SetConfState"/>. <see cref="MemoryStorage"/> and the file store implement it.
 /// </summary>
+/// <remarks>
+/// Without a recorded index the node cannot tell which configuration changes the stored membership already reflects.
+/// When the membership was stored after a change whose commit was not yet durable, a restart applies the changes
+/// committed after the stored commit index again, as earlier versions did. Both built-in stores record the index once
+/// the node applies a configuration change; bootstrapping a new store with
+/// <see cref="SetConfState(ConfState, ulong)"/> at index zero records it from the start and closes this window.
+/// </remarks>
 public interface IRaftConfStateIndexStorage : IRaftWritableStorage
 {
     /// <summary>

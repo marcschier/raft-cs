@@ -13,12 +13,14 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
     private const string HardStateFileName = "hardstate";
     private const string SnapshotFileName = "snapshot";
     private const string NewSnapshotFileName = "snapshot.new";
+    private const string NewLogFileName = "log.new";
     private const byte EntryRecord = 0;
     private const byte TruncateRecord = 1;
     private const byte CompactRecord = 2;
     private const byte HardStateRecord = 3;
     private const byte ConfStateRecord = 4;
     private const byte ConfStateIndexRecord = 5;
+    private const byte LogGenerationRecord = 6;
     private const int LengthPrefixSize = 4;
     private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
     private const int HardStateRecordSize = 1 + (3 * 8);
@@ -31,19 +33,34 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         (byte)'R', (byte)'S', (byte)'P', (byte)'M', 0, 0, 0, 1,
     };
 
+    // Ends a snapshot file that, beyond the membership at its index, records before the marker the generation of the
+    // log that continues it. The snapshot supersedes every log of an earlier generation.
+    private static readonly byte[] LogGenerationMarker =
+    {
+        (byte)'R', (byte)'S', (byte)'P', (byte)'M', 0, 0, 0, 2,
+    };
+
     private readonly object _gate = new();
     private readonly string _hardStatePath;
     private readonly string _snapshotPath;
     private readonly string _newSnapshotPath;
+    private readonly string _logPath;
+    private readonly string _newLogPath;
     private readonly string _directoryPath;
     private readonly bool _fsync;
     private readonly List<Entry> _entries = new() { default };
-    private readonly FileStream _logStream;
+    private FileStream _logStream;
     private HardState _hardState;
     private Snapshot _snapshot = new(new SnapshotMetadata(0, 0, new ConfState()), ReadOnlyMemory<byte>.Empty);
     private ConfState _confState = new();
     private ulong? _confStateIndex = 0;
     private ulong? _pendingConfStateIndex;
+
+    // The generation of the log file: zero for a log written before generations were recorded.
+    private ulong _logGeneration;
+
+    // The generation of the log that continues the snapshot, or null when the snapshot file records none.
+    private ulong? _snapshotGeneration;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -55,18 +72,39 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         Directory.CreateDirectory(options.DirectoryPath);
         _directoryPath = options.DirectoryPath;
         _fsync = options.Fsync;
-        string logPath = Path.Combine(options.DirectoryPath, LogFileName);
+        _logPath = Path.Combine(options.DirectoryPath, LogFileName);
+        _newLogPath = Path.Combine(options.DirectoryPath, NewLogFileName);
         _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
         _snapshotPath = Path.Combine(options.DirectoryPath, SnapshotFileName);
         _newSnapshotPath = Path.Combine(options.DirectoryPath, NewSnapshotFileName);
 
-        // A snapshot that was still being written when the process stopped is incomplete; the former one is intact.
+        // A snapshot or log that was still being written beside the current one when the process stopped was never
+        // published; the current one is intact.
         System.IO.File.Delete(_newSnapshotPath);
+        System.IO.File.Delete(_newLogPath);
 
         LoadSnapshot();
         LoadHardState();
-        long intactLength = ReplayLog(logPath);
-        _logStream = new FileStream(logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        ulong logGeneration = ReadLogGeneration();
+        if (_snapshotGeneration is { } snapshotGeneration && logGeneration != snapshotGeneration)
+        {
+            if (logGeneration > snapshotGeneration)
+            {
+                throw new InvalidDataException(
+                    $"The log file '{_logPath}' continues a newer snapshot than the one in '{_snapshotPath}'.");
+            }
+
+            // The snapshot was installed, but the process stopped before the log it supersedes was replaced. Of that
+            // log only the hard state (term and vote) still holds; the installation is completed.
+            ReplayLog(hardStateOnly: true);
+            _logStream = OpenLog();
+            InstallSnapshot(_snapshot, snapshotGeneration);
+            return;
+        }
+
+        _logGeneration = logGeneration;
+        long intactLength = ReplayLog(hardStateOnly: false);
+        _logStream = OpenLog();
         if (_logStream.Length > intactLength)
         {
             // The bytes after the intact log are the torn last write: an incomplete record, or an index record whose
@@ -74,9 +112,8 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             // index record is not paired with a configuration later written without an index.
             _logStream.SetLength(intactLength);
             FlushLog();
+            _logStream.Seek(0, SeekOrigin.End);
         }
-
-        _logStream.Seek(0, SeekOrigin.End);
     }
 
     /// <inheritdoc/>
@@ -308,17 +345,71 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
         }
 
-        WriteSnapshot(snapshot);
-        ResetLogFile();
-        _snapshot = CopySnapshot(snapshot);
+        // The snapshot names the next log generation and is published first: a reopen after a crash before the log
+        // it supersedes is replaced completes the installation.
+        ulong generation = _logGeneration + 1;
+        WriteSnapshot(snapshot, generation);
+        InstallSnapshot(CopySnapshot(snapshot), generation);
+    }
+
+    /// <summary>
+    /// Takes over a published snapshot that supersedes the log, and replaces the log with one of
+    /// <paramref name="generation"/> that holds only the state the snapshot leaves.
+    /// </summary>
+    private void InstallSnapshot(Snapshot snapshot, ulong generation)
+    {
+        ulong index = snapshot.Metadata.Index;
+        _snapshot = snapshot;
+        _snapshotGeneration = generation;
         _confState = snapshot.Metadata.ConfState;
-        _entries.Clear();
-        _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));
-        _hardState = new HardState(Math.Max(_hardState.Term, snapshot.Metadata.Term), _hardState.Vote, index);
         _confStateIndex = index;
-        WriteConfStateRecords(_confState, index);
-        WriteHardStateRecord(_hardState);
-        FlushLog();
+        _entries.Clear();
+        _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, index, default));
+        _hardState = new HardState(Math.Max(_hardState.Term, snapshot.Metadata.Term), _hardState.Vote, index);
+        ReplaceLog(generation, index);
+    }
+
+    /// <summary>
+    /// Writes a log of <paramref name="generation"/> beside the current one and swaps it in, so after a crash either
+    /// the former or the new log is in place.
+    /// </summary>
+    private void ReplaceLog(ulong generation, ulong confStateIndex)
+    {
+        FileStream current = _logStream;
+        using (var next = new FileStream(_newLogPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            _logStream = next;
+            try
+            {
+                WriteLogGenerationRecord(generation);
+                WriteConfStateRecords(_confState, confStateIndex);
+                WriteHardStateRecord(_hardState);
+                FlushLog();
+            }
+            finally
+            {
+                _logStream = current;
+            }
+        }
+
+        current.Dispose();
+        try
+        {
+            PublishFile(_newLogPath, _logPath, "log");
+        }
+        finally
+        {
+            _logStream = OpenLog();
+        }
+
+        _logGeneration = generation;
+    }
+
+    private FileStream OpenLog()
+    {
+        var stream = new FileStream(_logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        stream.Seek(0, SeekOrigin.End);
+        return stream;
     }
 
     /// <inheritdoc/>
@@ -351,8 +442,10 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
                 FlushLog();
             }
 
-            WriteSnapshot(snapshot);
+            // The log continues after this snapshot, so the snapshot names the log's own generation.
+            WriteSnapshot(snapshot, _logGeneration);
             _snapshot = snapshot;
+            _snapshotGeneration = _logGeneration;
             return snapshot;
         }
     }
@@ -595,11 +688,18 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             throw DamagedSnapshot();
         }
 
-        // Without the marker, an earlier version wrote the file: its membership is the latest one the store recorded,
-        // not the one at the snapshot's index, so the index that membership reflects is unknown.
+        // Without a marker, an earlier version wrote the file: its membership is the latest one the store recorded,
+        // not the one at the snapshot's index, so the index that membership reflects is unknown. Only the second
+        // marker records the generation of the log that continues the snapshot.
         ReadOnlySpan<byte> trailer = data.AsSpan(offset);
         bool membershipIsAtIndex = !trailer.IsEmpty;
-        if (membershipIsAtIndex && !trailer.SequenceEqual(PointInTimeMembershipMarker))
+        if (trailer.Length == UInt64Size + LogGenerationMarker.Length
+            && trailer.Slice(UInt64Size).SequenceEqual(LogGenerationMarker))
+        {
+            int generationOffset = 0;
+            _snapshotGeneration = ReadUInt64(trailer, ref generationOffset);
+        }
+        else if (membershipIsAtIndex && !trailer.SequenceEqual(PointInTimeMembershipMarker))
         {
             throw DamagedSnapshot();
         }
@@ -635,17 +735,42 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
     }
 
     /// <summary>
-    /// Replays the log records into memory; returns the length of the intact log: the end of the last complete record,
-    /// before a trailing index record whose configuration record is missing.
+    /// Returns the generation the log file records in its first record, or zero when it records none: the log was
+    /// written before generations were recorded, or never replaced by an installed snapshot.
     /// </summary>
-    private long ReplayLog(string logPath)
+    private ulong ReadLogGeneration()
     {
-        if (!System.IO.File.Exists(logPath))
+        if (!System.IO.File.Exists(_logPath))
         {
             return 0;
         }
 
-        using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var stream = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var record = new byte[LengthPrefixSize + 1 + UInt64Size];
+        if (!ReadExactly(stream, record, 0, record.Length)
+            || BinaryPrimitives.ReadInt32BigEndian(record) != 1 + UInt64Size
+            || record[LengthPrefixSize] != LogGenerationRecord)
+        {
+            return 0;
+        }
+
+        int offset = LengthPrefixSize + 1;
+        return ReadUInt64(record, ref offset);
+    }
+
+    /// <summary>
+    /// Replays the log records into memory, or only its hard state records when <paramref name="hardStateOnly"/>;
+    /// returns the length of the intact log: the end of the last complete record, before a trailing index record whose
+    /// configuration record is missing.
+    /// </summary>
+    private long ReplayLog(bool hardStateOnly)
+    {
+        if (!System.IO.File.Exists(_logPath))
+        {
+            return 0;
+        }
+
+        using var stream = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         long fileLength = stream.Length;
         var lengthBuffer = new byte[LengthPrefixSize];
         long intactLength = 0;
@@ -664,7 +789,10 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
                 break;
             }
 
-            ReplayRecord(payload);
+            if (!hardStateOnly || payload[0] == HardStateRecord)
+            {
+                ReplayRecord(payload);
+            }
 
             // An index record is intact only together with the configuration record written right after it.
             if (_pendingConfStateIndex is null)
@@ -869,17 +997,19 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         _logStream.Flush(_fsync);
     }
 
-    private void ResetLogFile()
+    private void WriteLogGenerationRecord(ulong generation)
     {
-        _logStream.SetLength(0);
-        _logStream.Seek(0, SeekOrigin.Begin);
-        FlushLog();
+        Span<byte> payload = stackalloc byte[1 + UInt64Size];
+        payload[0] = LogGenerationRecord;
+        int offset = 1;
+        WriteUInt64(payload, ref offset, generation);
+        WriteRecord(payload);
     }
 
-    private void WriteSnapshot(Snapshot snapshot)
+    private void WriteSnapshot(Snapshot snapshot, ulong logGeneration)
     {
         int length = 8 + 8 + 4 + snapshot.Data.Length + ConfStateLength(snapshot.Metadata.ConfState)
-            + PointInTimeMembershipMarker.Length;
+            + UInt64Size + LogGenerationMarker.Length;
         byte[] data = new byte[length];
         int offset = 0;
         WriteUInt64(data, ref offset, snapshot.Metadata.Index);
@@ -891,7 +1021,8 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         WriteConfState(data, ref offset, snapshot.Metadata.ConfState);
 
         // After every field an earlier version reads, which ignores the bytes that follow.
-        PointInTimeMembershipMarker.CopyTo(data, offset);
+        WriteUInt64(data, ref offset, logGeneration);
+        LogGenerationMarker.CopyTo(data, offset);
 
         // Written beside the snapshot and then swapped in, so after a crash either the former or the new snapshot is
         // in place.
@@ -901,26 +1032,32 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             stream.Flush(_fsync);
         }
 
+        PublishFile(_newSnapshotPath, _snapshotPath, "snapshot");
+    }
+
+    /// <summary>Replaces <paramref name="path"/> with the durable file <paramref name="newPath"/>.</summary>
+    private void PublishFile(string newPath, string path, string kind)
+    {
         if (_fsync && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            if (!MoveFileEx(_newSnapshotPath, _snapshotPath, MoveFileReplaceExisting | MoveFileWriteThrough))
+            if (!MoveFileEx(newPath, path, MoveFileReplaceExisting | MoveFileWriteThrough))
             {
-                throw new IOException($"Could not publish snapshot durably (error {Marshal.GetLastWin32Error()}).");
+                throw new IOException($"Could not publish {kind} durably (error {Marshal.GetLastWin32Error()}).");
             }
         }
-        else if (System.IO.File.Exists(_snapshotPath))
+        else if (System.IO.File.Exists(path))
         {
-            System.IO.File.Replace(_newSnapshotPath, _snapshotPath, destinationBackupFileName: null);
+            System.IO.File.Replace(newPath, path, destinationBackupFileName: null);
         }
         else
         {
-            System.IO.File.Move(_newSnapshotPath, _snapshotPath);
+            System.IO.File.Move(newPath, path);
         }
 
-        FlushSnapshotDirectory();
+        FlushDirectory();
     }
 
-    private void FlushSnapshotDirectory()
+    private void FlushDirectory()
     {
         if (!_fsync)
         {
@@ -937,7 +1074,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         int directory = Open(_directoryPath, OpenReadOnly);
         if (directory < 0)
         {
-            throw new IOException($"Could not open snapshot directory for syncing (error {Marshal.GetLastWin32Error()}).");
+            throw new IOException($"Could not open store directory for syncing (error {Marshal.GetLastWin32Error()}).");
         }
 
         int closeResult = 0;
@@ -945,7 +1082,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         {
             if (Fsync(directory) != 0)
             {
-                throw new IOException($"Could not sync snapshot directory (error {Marshal.GetLastWin32Error()}).");
+                throw new IOException($"Could not sync store directory (error {Marshal.GetLastWin32Error()}).");
             }
         }
         finally
@@ -956,7 +1093,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         if (closeResult != 0)
         {
             throw new IOException(
-                $"Could not close snapshot directory after syncing (error {Marshal.GetLastWin32Error()}).");
+                $"Could not close store directory after syncing (error {Marshal.GetLastWin32Error()}).");
         }
     }
 

@@ -2,6 +2,7 @@
 
 using System.Text;
 using Raft.Configuration;
+using Raft.Messages;
 using Raft.Storage;
 using Raft.Transport;
 
@@ -15,6 +16,24 @@ namespace Raft.Tests;
 public sealed class RaftNodeCustomStorageTests
 {
     private static readonly ulong[] Learners = { 2 };
+
+    // Index 2 enters a joint configuration removing node 2, index 3 leaves it, and index 4 enters a joint configuration
+    // adding node 3.
+    private static readonly ConfState Initial = new(new ulong[] { 1, 2 });
+
+    private static readonly ConfChangeV2 EnterJointRemove2 = new(
+        new[] { new ConfChangeSingle(ConfChangeType.RemoveNode, 2) },
+        useJoint: true);
+
+    private static readonly ConfChangeV2 Leave = ConfChangeV2.LeaveJoint();
+
+    private static readonly ConfChangeV2 EnterJointAdd3 = new(
+        new[] { new ConfChangeSingle(ConfChangeType.AddNode, 3) },
+        useJoint: true);
+
+    private static readonly ConfState Latest = Changer.Apply(
+        Changer.Apply(Changer.Apply(Initial, EnterJointRemove2), Leave),
+        EnterJointAdd3);
 
     [Test]
     public async Task WritableOnlyStorage_CommitsAndRestarts()
@@ -127,36 +146,57 @@ public sealed class RaftNodeCustomStorageTests
     [Test]
     public async Task SnapshotStorageWithoutConfStateIndex_KeepsTheStoredMembershipOverAnOlderSnapshot()
     {
-        // Index 2 enters a joint configuration removing node 2, index 3 leaves it, and index 4 enters a joint
-        // configuration adding node 3.
-        var initial = new ConfState(new ulong[] { 1, 2 });
-        var enterJointRemove2 = new ConfChangeV2(
-            new[] { new ConfChangeSingle(ConfChangeType.RemoveNode, 2) },
-            useJoint: true);
-        ConfChangeV2 leave = ConfChangeV2.LeaveJoint();
-        var enterJointAdd3 = new ConfChangeV2(
-            new[] { new ConfChangeSingle(ConfChangeType.AddNode, 3) },
-            useJoint: true);
-        ConfState latest = Changer.Apply(
-            Changer.Apply(Changer.Apply(initial, enterJointRemove2), leave),
-            enterJointAdd3);
+        // Without a recorded index, the changes committed after the stored commit are applied again once their commit
+        // is known, although the stored membership already reflects them: the behaviour of earlier versions.
+        ConfState afterCommit = await RestartWithTheMembershipAheadOfTheCommitAsync(
+            new SnapshotStorageWithoutConfStateIndex(Initial),
+            storage => storage.SetConfState(Latest));
+        ConfState reapplied = Changer.Apply(
+            Changer.Apply(Changer.Apply(Latest, EnterJointRemove2), Leave),
+            EnterJointAdd3);
+        await Assert.That(afterCommit.Equals(reapplied)).IsTrue();
+        await Assert.That(afterCommit.VotersOutgoing.OrderBy(id => id).SequenceEqual(new ulong[] { 1, 3 })).IsTrue();
+    }
 
-        var storage = new SnapshotStorageWithoutConfStateIndex(initial);
+    [Test]
+    public async Task SnapshotStorageWithAConfStateIndex_DoesNotReapplyTheRecordedChanges()
+    {
+        ConfState afterCommit = await RestartWithTheMembershipAheadOfTheCommitAsync(
+            new MemoryStorage(Initial),
+            storage => ((IRaftConfStateIndexStorage)storage).SetConfState(Latest, 4));
+        await Assert.That(afterCommit.Equals(Latest)).IsTrue();
+        await Assert.That(afterCommit.VotersOutgoing.SequenceEqual(new ulong[] { 1 })).IsTrue();
+    }
+
+    /// <summary>
+    /// Stores the joint-change log with a snapshot at index 1, stores the membership after index 4 with
+    /// <paramref name="storeMembership"/> while the stored commit is 1, restarts a node, and checks it keeps that
+    /// membership over the snapshot's. Then a leader reports the commit of index 4; returns the membership after it.
+    /// </summary>
+    private static async Task<ConfState> RestartWithTheMembershipAheadOfTheCommitAsync(
+        IRaftSnapshotStorage storage,
+        Action<IRaftSnapshotStorage> storeMembership)
+    {
         storage.Append(new[]
         {
             new Entry(EntryType.Normal, 1, 1, default),
-            new Entry(EntryType.ConfChangeV2, 1, 2, enterJointRemove2.Encode()),
-            new Entry(EntryType.ConfChangeV2, 1, 3, leave.Encode()),
-            new Entry(EntryType.ConfChangeV2, 1, 4, enterJointAdd3.Encode()),
+            new Entry(EntryType.ConfChangeV2, 1, 2, EnterJointRemove2.Encode()),
+            new Entry(EntryType.ConfChangeV2, 1, 3, Leave.Encode()),
+            new Entry(EntryType.ConfChangeV2, 1, 4, EnterJointAdd3.Encode()),
         });
-        storage.CreateSnapshot(1, initial, new byte[] { 1 });
+        storage.CreateSnapshot(1, Initial, new byte[] { 1 });
 
         // The membership after index 4 was stored, but the process stopped before the commit of index 4 was durable.
-        storage.SetConfState(latest);
+        storeMembership(storage);
         storage.SetHardState(new HardState(1, 0, 1));
 
         await using var network = new InMemoryNetwork();
-        RaftNode node = CreateSingleNode(network, storage);
+        var node = new RaftNode(
+            new RaftConfig { Id = 1, RandomizedElectionTimeout = 1000 },
+            storage,
+            network.CreateNode(1),
+            new RaftNodeOptions { TickInterval = TimeSpan.FromMilliseconds(10) });
+        IRaftTransport leader = network.CreateNode(3);
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -164,7 +204,20 @@ public sealed class RaftNodeCustomStorageTests
             await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
             await Assert.That(snapshot.Index).IsEqualTo(1UL);
             await Assert.That(node.AppliedIndex).IsEqualTo(1UL);
-            await Assert.That(node.Configuration.Equals(latest)).IsTrue();
+            await Assert.That(node.Configuration.Equals(Latest)).IsTrue();
+
+            await leader.StartAsync(timeout.Token);
+            await node.StartAsync(timeout.Token);
+            var heartbeat = new Message { Type = MessageType.Heartbeat, From = 3, To = 1, Term = 2, Commit = 4 };
+            byte[] frame = new byte[MessageCodec.EncodedLength(heartbeat)];
+            MessageCodec.TryWrite(heartbeat, frame);
+            await leader.SendAsync(1, frame, timeout.Token);
+            while (node.AppliedIndex < 4)
+            {
+                await Task.Delay(10, timeout.Token);
+            }
+
+            return node.Configuration;
         }
         finally
         {

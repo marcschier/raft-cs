@@ -619,6 +619,180 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task ApplySnapshot_StoppedBeforeTheLogIsReplaced_CompletesTheInstallationOnReopen()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var installed = new Configuration.ConfState(TwoVoters);
+            string logPath = Path.Combine(directory, "log");
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 5));
+                storage.SetHardState(new HardState(9, 2, 5));
+                storage.SetConfState(new Configuration.ConfState(OneVoter, OneLearner));
+            }
+
+            byte[] supersededLog = System.IO.File.ReadAllBytes(logPath);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.ApplySnapshot(new Snapshot(new SnapshotMetadata(8, 4, installed), new byte[] { 8 }));
+            }
+
+            // The snapshot was published, but the process stopped while the log replacing the superseded one, which
+            // still holds a configuration stored without an index, was being written beside it.
+            System.IO.File.WriteAllBytes(logPath, supersededLog);
+            System.IO.File.WriteAllBytes(Path.Combine(directory, "log.new"), new byte[] { 0, 0 });
+
+            for (int reopen = 0; reopen < 2; reopen++)
+            {
+                using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+                Snapshot? snapshot = reopened.LatestSnapshot();
+                await Assert.That(snapshot).IsNotNull();
+                await Assert.That(snapshot!.Metadata.Index).IsEqualTo(8UL);
+                await Assert.That(snapshot.Data.ToArray().SequenceEqual(new byte[] { 8 })).IsTrue();
+                await Assert.That(reopened.InitialState().ConfState.Equals(installed)).IsTrue();
+                await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)8);
+
+                // The term and vote of the superseded log still hold; the commit is the snapshot's.
+                await Assert.That(reopened.InitialState().HardState).IsEqualTo(new HardState(9, 2, 8));
+                await Assert.That(reopened.FirstIndex()).IsEqualTo(9UL);
+                await Assert.That(reopened.LastIndex()).IsEqualTo(8UL);
+            }
+
+            await Assert.That(System.IO.File.Exists(Path.Combine(directory, "log.new"))).IsFalse();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task ApplySnapshot_StoppedBeforeTheSnapshotIsPublished_KeepsTheFormerState()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var former = new Configuration.ConfState(OneVoter, OneLearner);
+            string logPath = Path.Combine(directory, "log");
+            string snapshotPath = Path.Combine(directory, "snapshot");
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 5));
+                storage.SetHardState(new HardState(9, 2, 5));
+                storage.SetConfState(former);
+            }
+
+            byte[] formerLog = System.IO.File.ReadAllBytes(logPath);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.ApplySnapshot(
+                    new Snapshot(new SnapshotMetadata(8, 4, new Configuration.ConfState(TwoVoters)), new byte[] { 8 }));
+            }
+
+            // The process stopped while the snapshot was being written beside the former state, which is intact.
+            System.IO.File.Move(snapshotPath, Path.Combine(directory, "snapshot.new"));
+            System.IO.File.WriteAllBytes(logPath, formerLog);
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.LatestSnapshot()).IsNull();
+            await Assert.That(reopened.InitialState().ConfState.Equals(former)).IsTrue();
+            await Assert.That(reopened.ConfStateIndex()).IsNull();
+            await Assert.That(reopened.InitialState().HardState).IsEqualTo(new HardState(9, 2, 5));
+            await AssertEntriesEqual(reopened.Entries(1, 6, ulong.MaxValue), CreateEntries(1, 5));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task CreateSnapshot_KeepsTheLogItContinues_AcrossReopen()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var current = new Configuration.ConfState(OneVoter, OneLearner);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 6));
+                storage.SetHardState(new HardState(6, 1, 6));
+                storage.SetConfState(current);
+                storage.CreateSnapshot(4, new Configuration.ConfState(TwoVoters), new byte[] { 4 });
+            }
+
+            // A created snapshot supersedes no log: the configuration stored before it is still the current one.
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.LatestSnapshot()!.Metadata.Index).IsEqualTo(4UL);
+            await Assert.That(reopened.InitialState().ConfState.Equals(current)).IsTrue();
+            await Assert.That(reopened.ConfStateIndex()).IsNull();
+            await Assert.That(reopened.InitialState().HardState).IsEqualTo(new HardState(6, 1, 6));
+            await AssertEntriesEqual(reopened.Entries(5, 7, ulong.MaxValue), CreateEntries(5, 2));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Reopen_RefusesALogThatContinuesANewerSnapshot()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            string snapshotPath = Path.Combine(directory, "snapshot");
+            byte[] olderSnapshot;
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.ApplySnapshot(
+                    new Snapshot(new SnapshotMetadata(5, 5, new Configuration.ConfState(TwoVoters)), new byte[] { 5 }));
+                olderSnapshot = System.IO.File.ReadAllBytes(snapshotPath);
+                storage.ApplySnapshot(
+                    new Snapshot(new SnapshotMetadata(7, 7, new Configuration.ConfState(TwoVoters)), new byte[] { 7 }));
+            }
+
+            // The log was replaced for the snapshot at index 7, but the snapshot file is the one before it.
+            System.IO.File.WriteAllBytes(snapshotPath, olderSnapshot);
+
+            await Assert.That(() => new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+                .Throws<InvalidDataException>();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task SnapshotFileWithoutALogGeneration_ReadsWithItsMembershipAtItsIndex()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            // A snapshot file written with the first marker, which records no log generation.
+            var confState = new Configuration.ConfState(TwoVoters);
+            new LegacyStoreFormat.Log().Append(CreateEntries(5, 2)).WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 4, confState, new byte[] { 4 });
+            string snapshotPath = Path.Combine(directory, "snapshot");
+            byte[] firstMarker = { (byte)'R', (byte)'S', (byte)'P', (byte)'M', 0, 0, 0, 1 };
+            System.IO.File.WriteAllBytes(
+                snapshotPath, System.IO.File.ReadAllBytes(snapshotPath).Concat(firstMarker).ToArray());
+
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(storage.LatestSnapshot()!.Metadata.Index).IsEqualTo(4UL);
+            await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)4);
+            await AssertEntriesEqual(storage.Entries(5, 7, ulong.MaxValue), CreateEntries(5, 2));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task CreateSnapshot_WithFsync_PublishesItDurably()
     {
         string directory = CreateDirectory();

@@ -20,8 +20,8 @@ internal sealed class CommittedQueue
             SingleWriter = true,
         });
 
-    // The snapshots in the queue, so the payload reader counts commands only.
-    private int _pendingSnapshots;
+    // The commands in the queue: the payload reader's count, which a single counter keeps exact at every read.
+    private int _pendingCommands;
 
     internal CommittedQueue()
     {
@@ -35,16 +35,16 @@ internal sealed class CommittedQueue
 
     internal void Write(CommittedItem item)
     {
-        // Counted before it is queued, so a reader that takes it never sees it uncounted.
-        bool snapshot = item.Kind == CommittedItemKind.Snapshot;
-        if (snapshot)
+        // Counted before it is queued, so a reader that takes it never drives the count below zero.
+        bool command = item.Kind == CommittedItemKind.Command;
+        if (command)
         {
-            Interlocked.Increment(ref _pendingSnapshots);
+            Interlocked.Increment(ref _pendingCommands);
         }
 
-        if (!_channel.Writer.TryWrite(item) && snapshot)
+        if (!_channel.Writer.TryWrite(item) && command)
         {
-            Interlocked.Decrement(ref _pendingSnapshots);
+            Interlocked.Decrement(ref _pendingCommands);
         }
     }
 
@@ -57,9 +57,9 @@ internal sealed class CommittedQueue
             return false;
         }
 
-        if (item.Kind == CommittedItemKind.Snapshot)
+        if (item.Kind == CommittedItemKind.Command)
         {
-            Interlocked.Decrement(ref _pendingSnapshots);
+            Interlocked.Decrement(ref _pendingCommands);
         }
 
         return true;
@@ -100,9 +100,8 @@ internal sealed class CommittedQueue
 
         public override bool CanCount => true;
 
-        // The queued items without the queued snapshots. With concurrent readers it is a point-in-time value.
-        public override int Count =>
-            Math.Max(0, _queue._channel.Reader.Count - Volatile.Read(ref _queue._pendingSnapshots));
+        // The queued commands. With concurrent readers it is a point-in-time value.
+        public override int Count => Math.Max(0, Volatile.Read(ref _queue._pendingCommands));
 
         public override bool CanPeek => false;
 

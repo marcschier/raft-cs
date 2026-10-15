@@ -62,7 +62,7 @@ await using var node = new RaftNode(config, storage, transport);
 await node.StartAsync();
 ```
 
-Index 0 (the `IRaftConfStateIndexStorage` overload) records that the membership precedes every log entry, so a node that crashes after a membership change commits, but before the new membership is recorded, applies the change on restart. The one-argument `SetConfState(confState)` is the compatible form: it leaves the index unknown, and a restarting node then keeps the stored membership as it is.
+Index 0 (the `IRaftConfStateIndexStorage` overload) records that the membership precedes every log entry, so a node that crashes after a membership change commits, but before the new membership is recorded, applies the change on restart. The one-argument `SetConfState(confState)` is the compatible form: it leaves the index unknown, and a restarting node then keeps the stored membership as it is. Without a recorded index, a restart can also apply configuration changes committed after the stored commit index again although the stored membership already reflects them, as earlier versions did. Both built-in stores record the index once a configuration change is applied, and bootstrapping with `SetConfState(initial, 0)` records it from the start, which closes this window.
 
 Add or remove members at runtime with `ChangeConfigurationAsync` (single or joint changes, including learners). Watch `CommittedConfigurations` to learn when a change commits.
 
