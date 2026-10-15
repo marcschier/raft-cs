@@ -162,6 +162,29 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task Snapshot_FallbackUsesThePersistedCurrentMembership()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var confState = new Configuration.ConfState(TwoVoters, OneLearner);
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            storage.Append(CreateEntries(1, 2));
+            storage.SetHardState(new HardState(2, 1, 2));
+            storage.SetConfState(confState);
+
+            Snapshot fallback = storage.Snapshot(2);
+
+            await Assert.That(fallback.Data.IsEmpty).IsTrue();
+            await Assert.That(fallback.Metadata.ConfState.Equals(confState)).IsTrue();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task CreateSnapshot_WithFsync_PublishesItDurably()
     {
         string directory = CreateDirectory();

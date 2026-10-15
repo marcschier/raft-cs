@@ -159,7 +159,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
             }
 
             ulong term = TermLocked(appliedIndex);
-            var metadata = new SnapshotMetadata(appliedIndex, term, _snapshot.Metadata.ConfState);
+            var metadata = new SnapshotMetadata(appliedIndex, term, _confState);
             return new Snapshot(metadata, ReadOnlyMemory<byte>.Empty);
         }
     }

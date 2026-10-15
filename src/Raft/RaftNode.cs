@@ -78,7 +78,6 @@ public sealed class RaftNode : IAsyncDisposable
         _confState = storage.InitialState().ConfState;
         Snapshot? restored = RestoreLatestSnapshot();
         _appliedIndex = (long)_core.Applied;
-        _confHistory.Add(new KeyValuePair<ulong, ConfState>(_core.Applied, _confState));
         _inbox = Channel.CreateUnbounded<object>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -95,6 +94,7 @@ public sealed class RaftNode : IAsyncDisposable
         if (restored is not null)
         {
             _committed.Writer.TryWrite(CommittedItem.ForSnapshot(restored));
+            _confHistory.Add(new KeyValuePair<ulong, ConfState>(restored.Metadata.Index, _confState));
         }
 
         int capacity = _options.StateObservationCapacity;
@@ -111,6 +111,15 @@ public sealed class RaftNode : IAsyncDisposable
         };
         _stateChanges = Channel.CreateBounded<RaftStateChange>(observationOptions);
         _confChanges = Channel.CreateBounded<ConfState>(observationOptions);
+
+        // A stored initial configuration has no index. Without a snapshot, use it only from the latest committed
+        // configuration entry (or the commit index when none remains); earlier membership cannot be reconstructed.
+        // With a snapshot, replay the committed suffix now, while the snapshot membership is installed and before
+        // inbox messages, ticks, or campaigns can observe the core.
+        ApplyCommitted(
+            replayConfigurationChanges: restored is not null,
+            persistConfiguration: false,
+            publishConfiguration: false);
 
         // Seed the committed-configuration stream and poll property with the recovered baseline membership so a
         // stream-only consumer observes the starting configuration before any change.
@@ -509,7 +518,10 @@ public sealed class RaftNode : IAsyncDisposable
         _inbox.Writer.TryWrite(new AppendComplete(write));
     }
 
-    private void ApplyCommitted()
+    private void ApplyCommitted(
+        bool replayConfigurationChanges = true,
+        bool persistConfiguration = true,
+        bool publishConfiguration = true)
     {
         IReadOnlyList<Entry> toApply = _core.NextEntriesToApply();
         if (toApply.Count == 0)
@@ -517,11 +529,26 @@ public sealed class RaftNode : IAsyncDisposable
             return;
         }
 
+        if (!replayConfigurationChanges)
+        {
+            ulong baselineIndex = _core.CommitIndex;
+            foreach (Entry entry in toApply)
+            {
+                if (entry.Type is EntryType.ConfChange or EntryType.ConfChangeV2)
+                {
+                    baselineIndex = entry.Index;
+                }
+            }
+
+            _confHistory.Clear();
+            _confHistory.Add(new KeyValuePair<ulong, ConfState>(baselineIndex, _confState));
+        }
+
         ulong appliedTo = 0;
         List<CommittedItem>? commands = null;
         foreach (Entry entry in toApply)
         {
-            if (ApplyEntry(entry) is { } command)
+            if (ApplyEntry(entry, replayConfigurationChanges, persistConfiguration, publishConfiguration) is { } command)
             {
                 (commands ??= new List<CommittedItem>(toApply.Count)).Add(command);
             }
@@ -607,6 +634,12 @@ public sealed class RaftNode : IAsyncDisposable
 
     private ConfState ConfStateAt(ulong index)
     {
+        if (_confHistory.Count == 0 || index < _confHistory[0].Key)
+        {
+            throw new InvalidOperationException(
+                $"The membership at index {index} cannot be reconstructed without an earlier snapshot.");
+        }
+
         for (int i = _confHistory.Count - 1; i > 0; i--)
         {
             if (_confHistory[i].Key <= index)
@@ -656,7 +689,11 @@ public sealed class RaftNode : IAsyncDisposable
     }
 
     /// <summary>Applies one committed entry; returns the item to queue for a non-empty command.</summary>
-    private CommittedItem? ApplyEntry(Entry entry)
+    private CommittedItem? ApplyEntry(
+        Entry entry,
+        bool replayConfigurationChanges,
+        bool persistConfiguration,
+        bool publishConfiguration)
     {
         switch (entry.Type)
         {
@@ -670,16 +707,27 @@ public sealed class RaftNode : IAsyncDisposable
 
             case EntryType.ConfChange:
             case EntryType.ConfChangeV2:
+                if (!replayConfigurationChanges)
+                {
+                    break;
+                }
+
                 ConfChangeV2 change = ConfChangeV2.Decode(entry.Data.Span);
                 ConfState next = Changer.Apply(_confState, change);
                 _confState = next;
                 _confHistory.Add(new KeyValuePair<ulong, ConfState>(entry.Index, next));
                 _core.ApplyConfChange(next);
-                _storage.SetConfState(next);
+                if (persistConfiguration)
+                {
+                    _storage.SetConfState(next);
+                }
 
                 // Surface the committed membership so consumers can reconcile against it.
-                _publishedConfState = next;
-                _confChanges.Writer.TryWrite(next);
+                if (publishConfiguration)
+                {
+                    _publishedConfState = next;
+                    _confChanges.Writer.TryWrite(next);
+                }
                 break;
         }
 

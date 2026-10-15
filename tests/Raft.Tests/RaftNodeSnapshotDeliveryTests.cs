@@ -173,6 +173,73 @@ public sealed class RaftNodeSnapshotDeliveryTests
     }
 
     [Test]
+    public async Task Restart_ReplaysCommittedMembershipBeforeTheNodeStarts()
+    {
+        await using var network = new InMemoryNetwork();
+        var initial = new ConfState(new ulong[] { 1, 2 });
+        ConfChangeV2 change = new(
+            new[] { new ConfChangeSingle(ConfChangeType.RemoveNode, 2) },
+            useJoint: true);
+        ConfState latest = Changer.Apply(initial, change);
+        var storage = new MemoryStorage(initial);
+        storage.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.ConfChangeV2, 1, 2, change.Encode()),
+        });
+        storage.SetHardState(new HardState(1, 0, 2));
+        storage.CreateSnapshot(1, initial, new byte[] { 1 });
+        storage.SetConfState(latest);
+
+        RaftNode node = CreateSingleNode(network, storage);
+        try
+        {
+            await Assert.That(node.AppliedIndex).IsEqualTo(2UL);
+            await Assert.That(node.Configuration.Voters.SequenceEqual(new ulong[] { 1 })).IsTrue();
+            await Assert.That(node.Configuration.VotersOutgoing.SequenceEqual(initial.Voters)).IsTrue();
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task CreateSnapshotAsync_RejectsMembershipBeforeTheRecoverableBaseline()
+    {
+        await using var network = new InMemoryNetwork();
+        var initial = new ConfState(new ulong[] { 1, 2 });
+        ConfChangeV2 change = new(
+            new[] { new ConfChangeSingle(ConfChangeType.RemoveNode, 2) },
+            useJoint: true);
+        ConfState latest = Changer.Apply(initial, change);
+        var storage = new MemoryStorage(initial);
+        storage.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.ConfChangeV2, 1, 2, change.Encode()),
+        });
+        storage.SetHardState(new HardState(1, 0, 2));
+        storage.SetConfState(latest);
+
+        RaftNode node = CreateSingleNode(network, storage);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await node.StartAsync(timeout.Token);
+
+            await Assert.That(async () => await node.CreateSnapshotAsync(1, new byte[] { 1 }, timeout.Token))
+                .Throws<InvalidOperationException>();
+            SnapshotMetadata metadata = await node.CreateSnapshotAsync(2, new byte[] { 2 }, timeout.Token);
+            await Assert.That(metadata.ConfState.Equals(latest)).IsTrue();
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task LaggingFollower_ReceivesTheLeadersSnapshotOnCommittedItems()
     {
         await using var cluster = new LaggingFollowerCluster();
