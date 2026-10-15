@@ -33,6 +33,7 @@ Raft separates a **deterministic consensus core** from the **I/O that drives it*
 
 - **`MemoryStorage`** — volatile, with a sentinel entry marking the compacted boundary.
 - **`FileRaftStorage`** (package `RaftCs.Storage.File`) — a crash-safe append-only WAL plus hard-state and snapshot files, replayed on open and tolerant of a torn trailing record. `Compact` stages the retained WAL beside the current file and swaps it in only after the staged write succeeds, so a failed rewrite leaves the current in-memory and persisted log retryable. The WAL file is rewritten only when its owner, group, and access control can be preserved exactly on the staged file (on Unix the process must own the WAL and be able to give the staged file its group; Linux copies the POSIX ACL, macOS requires that neither file has an extended ACL, and other Unix systems never rewrite); otherwise the compaction is logical only — it is recorded in the WAL, which keeps its access and does not shrink. With `Fsync` enabled on Unix, it also syncs the containing directory after the swap before accepting another write.
+  **Upgrade and rollback:** a rewritten WAL starts with a compaction-base record that releases before this format do not understand; they refuse to open it rather than misread its indexes. Once a store has been compacted with this version, rolling a replica back requires a version that reads the compacted format.
 
 ## Membership — joint consensus
 
