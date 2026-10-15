@@ -679,9 +679,12 @@ public sealed class RaftNode : IAsyncDisposable
         ulong? storedIndex = _confStateIndexStorage?.ConfStateIndex();
         ulong baselineIndex;
         ulong replayConfigurationChangesAfter;
-        if (restored is { MembershipIsAtIndex: true } && !(storedIndex > restored.Metadata.Index))
+        if (restored is { MembershipIsAtIndex: true }
+            && storedIndex is { } recordedIndex
+            && recordedIndex <= restored.Metadata.Index)
         {
-            // The snapshot holds the membership at its index, and the store records none newer.
+            // The snapshot holds the membership at its index, and the store records its own at no later index. A store
+            // whose index is unknown may hold a newer membership than the snapshot; it is kept below.
             _confState = restored.Metadata.ConfState;
             _core.ApplyConfChange(_confState);
             baselineIndex = restored.Metadata.Index;
@@ -696,9 +699,9 @@ public sealed class RaftNode : IAsyncDisposable
         else
         {
             // The store does not record the index of its configuration (it does not implement
-            // IRaftConfStateIndexStorage, or the index is unknown, as with a snapshot whose membership is not the one
-            // at its index): use it only from the latest committed configuration entry (or the commit index when none
-            // remains), and replay no recovered change.
+            // IRaftConfStateIndexStorage, or the index is unknown): keep it, also over a snapshot's membership, use it
+            // only from the latest committed configuration entry (or the commit index when none remains), and replay
+            // no recovered change.
             baselineIndex = LatestCommittedConfigurationIndex();
             replayConfigurationChangesAfter = _core.CommitIndex;
         }

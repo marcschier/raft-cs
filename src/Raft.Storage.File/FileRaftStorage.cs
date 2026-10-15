@@ -179,8 +179,12 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
                 {
                     return _snapshot;
                 }
+
+                // A snapshot without the application state would skip the commands after this one.
+                throw new RaftStorageException(RaftStorageError.SnapshotTemporarilyUnavailable);
             }
 
+            // Without an application snapshot, the store has no application state to send: only the position.
             ulong appliedIndex = _hardState.Commit;
             if (requestIndex > appliedIndex)
             {

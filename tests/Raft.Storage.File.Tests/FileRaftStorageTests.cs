@@ -188,6 +188,30 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task Snapshot_AboveTheApplicationSnapshot_IsTemporarilyUnavailable()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 10));
+                storage.SetHardState(new HardState(10, 1, 10));
+                storage.CreateSnapshot(6, new Configuration.ConfState(TwoVoters), new byte[] { 6 });
+            }
+
+            // A position-only snapshot at the commit index would skip the commands after the application snapshot.
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.Snapshot(6).Metadata.Index).IsEqualTo(6UL);
+            await AssertStorageError(() => reopened.Snapshot(7), RaftStorageError.SnapshotTemporarilyUnavailable);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task ConfStateIndex_FollowsSetConfStateAndSnapshots_AndSurvivesReopen()
     {
         string directory = CreateDirectory();

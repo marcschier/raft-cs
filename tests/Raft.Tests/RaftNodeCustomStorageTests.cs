@@ -124,6 +124,54 @@ public sealed class RaftNodeCustomStorageTests
         }
     }
 
+    [Test]
+    public async Task SnapshotStorageWithoutConfStateIndex_KeepsTheStoredMembershipOverAnOlderSnapshot()
+    {
+        // Index 2 enters a joint configuration removing node 2, index 3 leaves it, and index 4 enters a joint
+        // configuration adding node 3.
+        var initial = new ConfState(new ulong[] { 1, 2 });
+        var enterJointRemove2 = new ConfChangeV2(
+            new[] { new ConfChangeSingle(ConfChangeType.RemoveNode, 2) },
+            useJoint: true);
+        ConfChangeV2 leave = ConfChangeV2.LeaveJoint();
+        var enterJointAdd3 = new ConfChangeV2(
+            new[] { new ConfChangeSingle(ConfChangeType.AddNode, 3) },
+            useJoint: true);
+        ConfState latest = Changer.Apply(
+            Changer.Apply(Changer.Apply(initial, enterJointRemove2), leave),
+            enterJointAdd3);
+
+        var storage = new SnapshotStorageWithoutConfStateIndex(initial);
+        storage.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.ConfChangeV2, 1, 2, enterJointRemove2.Encode()),
+            new Entry(EntryType.ConfChangeV2, 1, 3, leave.Encode()),
+            new Entry(EntryType.ConfChangeV2, 1, 4, enterJointAdd3.Encode()),
+        });
+        storage.CreateSnapshot(1, initial, new byte[] { 1 });
+
+        // The membership after index 4 was stored, but the process stopped before the commit of index 4 was durable.
+        storage.SetConfState(latest);
+        storage.SetHardState(new HardState(1, 0, 1));
+
+        await using var network = new InMemoryNetwork();
+        RaftNode node = CreateSingleNode(network, storage);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            CommittedItem snapshot = await node.CommittedItems.ReadAsync(timeout.Token);
+            await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+            await Assert.That(snapshot.Index).IsEqualTo(1UL);
+            await Assert.That(node.AppliedIndex).IsEqualTo(1UL);
+            await Assert.That(node.Configuration.Equals(latest)).IsTrue();
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+    }
+
     /// <summary>Commits a, b, a configuration change adding learner 2, then c; returns the commands read.</summary>
     private static async Task<List<string>> CommitWithLearnerAsync(RaftNode node, CancellationToken ct)
     {

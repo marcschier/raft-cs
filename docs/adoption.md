@@ -49,18 +49,20 @@ The node's own watermarks are available for coordination: `node.CommitIndex` (co
 Every voter needs the **same initial membership**, given as a `ConfState` of node ids.
 
 - **`MemoryStorage`** takes the membership in its constructor: `new MemoryStorage(new ConfState(new ulong[] {1,2,3}))`.
-- **`FileRaftStorage`** has no `ConfState` constructor. For a *fresh* cluster, seed it once (see below); on *restart* it recovers membership, log, and hard state from disk — do not re-seed.
+- **`FileRaftStorage`** has no `ConfState` constructor. For a *fresh* cluster, seed it once with `SetConfState(initial, 0)` (see below); on *restart* it recovers membership, log, and hard state from disk — do not re-seed.
 
 ```csharp
 using var storage = new FileRaftStorage(new FileRaftStorageOptions("/var/lib/raft/node1"));
 if (storage.InitialState().ConfState.Voters.Count == 0)
 {
-    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 }));
+    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 }), 0); // bootstrap once, at index 0
 }
 
 await using var node = new RaftNode(config, storage, transport);
 await node.StartAsync();
 ```
+
+Index 0 (the `IRaftConfStateIndexStorage` overload) records that the membership precedes every log entry, so a node that crashes after a membership change commits, but before the new membership is recorded, applies the change on restart. The one-argument `SetConfState(confState)` is the compatible form: it leaves the index unknown, and a restarting node then keeps the stored membership as it is.
 
 Add or remove members at runtime with `ChangeConfigurationAsync` (single or joint changes, including learners). Watch `CommittedConfigurations` to learn when a change commits.
 

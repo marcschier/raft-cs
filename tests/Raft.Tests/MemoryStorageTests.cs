@@ -218,6 +218,35 @@ public sealed class MemoryStorageTests
     }
 
     [Test]
+    public async Task Snapshot_AboveTheApplicationSnapshot_IsTemporarilyUnavailable()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        var entries = new Entry[10];
+        for (int i = 0; i < entries.Length; i++)
+        {
+            entries[i] = new Entry(EntryType.Normal, 1, (ulong)i + 1, default);
+        }
+
+        storage.Append(entries);
+        storage.SetHardState(new HardState(1, 0, 10));
+        Snapshot created = storage.CreateSnapshot(6, new ConfState(new ulong[] { 1 }), new byte[] { 6 });
+
+        // A position-only snapshot at the commit index would skip the commands after the application snapshot.
+        await Assert.That(storage.Snapshot(6)).IsSameReferenceAs(created);
+        RaftStorageException? error = null;
+        try
+        {
+            storage.Snapshot(7);
+        }
+        catch (RaftStorageException ex)
+        {
+            error = ex;
+        }
+
+        await Assert.That(error?.Error).IsEqualTo(RaftStorageError.SnapshotTemporarilyUnavailable);
+    }
+
+    [Test]
     public async Task ApplySnapshot_OlderThanCreatedSnapshot_Throws()
     {
         var storage = new MemoryStorage();

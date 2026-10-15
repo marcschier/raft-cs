@@ -161,11 +161,18 @@ public sealed class MemoryStorage : IRaftSnapshotStorage, IRaftConfStateIndexSto
     {
         lock (_gate)
         {
-            if (_snapshot is not null && requestIndex <= _snapshot.Metadata.Index)
+            if (_snapshot is not null)
             {
-                return _snapshot;
+                if (requestIndex <= _snapshot.Metadata.Index)
+                {
+                    return _snapshot;
+                }
+
+                // A snapshot without the application state would skip the commands after this one.
+                throw new RaftStorageException(RaftStorageError.SnapshotTemporarilyUnavailable);
             }
 
+            // Without an application snapshot, the store has no application state to send: only the position.
             ulong appliedIndex = _hardState.Commit;
             if (requestIndex > appliedIndex)
             {
