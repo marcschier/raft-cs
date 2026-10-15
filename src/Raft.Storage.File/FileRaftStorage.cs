@@ -62,15 +62,17 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         ThrowIfNull(options);
         ThrowIfNull(syncDirectory);
 
-        Directory.CreateDirectory(options.DirectoryPath);
+        // Resolve once: a later change of the working directory must not redirect a relative store's files.
+        string directory = Path.GetFullPath(options.DirectoryPath);
+        Directory.CreateDirectory(directory);
         _fsync = options.Fsync;
         _syncDirectory = syncDirectory;
         _statx = statx;
         _accessControl = accessControl;
-        _logPath = Path.Combine(options.DirectoryPath, LogFileName);
-        _compactingLogPath = Path.Combine(options.DirectoryPath, CompactingLogFileName);
-        _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
-        _snapshotPath = Path.Combine(options.DirectoryPath, SnapshotFileName);
+        _logPath = Path.Combine(directory, LogFileName);
+        _compactingLogPath = Path.Combine(directory, CompactingLogFileName);
+        _hardStatePath = Path.Combine(directory, HardStateFileName);
+        _snapshotPath = Path.Combine(directory, SnapshotFileName);
 
         // A compacted log that was still being written when the process stopped is incomplete; the log it was to
         // replace is intact.

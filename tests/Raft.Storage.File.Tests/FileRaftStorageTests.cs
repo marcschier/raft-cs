@@ -99,6 +99,46 @@ public sealed class FileRaftStorageTests
         }
     }
 
+    // Changes the process working directory, so it must not overlap tests that resolve relative paths.
+    [Test]
+    [NotInParallel]
+    public async Task Compact_WithARelativeDirectory_StaysInTheOriginalStoreAfterTheWorkingDirectoryChanges()
+    {
+        string first = CreateDirectory();
+        string second = CreateDirectory();
+        string original = Environment.CurrentDirectory;
+        try
+        {
+            using (var other = new FileRaftStorage(new FileRaftStorageOptions(Path.Combine(second, "store"))))
+            {
+                other.Append(CreateEntries(1, 3, payloadLength: 16));
+            }
+
+            byte[] otherLog = System.IO.File.ReadAllBytes(Path.Combine(second, "store", "log"));
+
+            Environment.CurrentDirectory = first;
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions("store") { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 20, payloadLength: 16));
+                Environment.CurrentDirectory = second;
+
+                storage.Compact(10);
+                storage.Append(CreateEntries(21, 1, payloadLength: 16));
+            }
+
+            await Assert.That(System.IO.File.ReadAllBytes(Path.Combine(second, "store", "log"))).IsEquivalentTo(otherLog);
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(Path.Combine(first, "store")));
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(11UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(21UL);
+        }
+        finally
+        {
+            Environment.CurrentDirectory = original;
+            DeleteDirectory(first);
+            DeleteDirectory(second);
+        }
+    }
+
     [Test]
     public async Task Compact_AdvancesFirstIndexAndRejectsOldEntries()
     {
