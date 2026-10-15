@@ -23,6 +23,12 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private const int HardStateRecordSize = 1 + (3 * 8);
     private const int BaseRecordSize = 1 + (2 * 8);
     private const int UInt64Size = 8;
+#if NET8_0_OR_GREATER
+    private const UnixFileMode PermissionBits =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute;
+#endif
 
     private readonly object _gate = new();
     private readonly string _logPath;
@@ -30,6 +36,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private readonly string _hardStatePath;
     private readonly string _snapshotPath;
     private readonly bool _fsync;
+    private readonly Action<string> _syncDirectory;
     private readonly List<Entry> _entries = new() { default };
     private FileStream _logStream;
     private HardState _hardState;
@@ -42,11 +49,18 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
     /// <param name="options">The storage options.</param>
     public FileRaftStorage(FileRaftStorageOptions options)
+        : this(options, SyncDirectoryDurably)
+    {
+    }
+
+    internal FileRaftStorage(FileRaftStorageOptions options, Action<string> syncDirectory)
     {
         ThrowIfNull(options);
+        ThrowIfNull(syncDirectory);
 
         Directory.CreateDirectory(options.DirectoryPath);
         _fsync = options.Fsync;
+        _syncDirectory = syncDirectory;
         _logPath = Path.Combine(options.DirectoryPath, LogFileName);
         _compactingLogPath = Path.Combine(options.DirectoryPath, CompactingLogFileName);
         _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
@@ -60,6 +74,21 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         LoadHardState();
         ReplayLog(_logPath);
         _logStream = OpenLog();
+        if (_fsync)
+        {
+            // A previous process may have replaced the log and stopped before the directory entry was made durable;
+            // writes acknowledged before that sync could be lost with the replacement on power loss.
+            try
+            {
+                SyncLogDirectory();
+            }
+            catch
+            {
+                _logStream.Dispose();
+                throw;
+            }
+        }
+
         _logWritable = true;
     }
 
@@ -727,8 +756,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     /// </summary>
     private void RewriteLog(List<Entry> compactedEntries)
     {
-        using (var compacted = new FileStream(
-            _compactingLogPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (FileStream compacted = CreateCompactingLog())
         {
             WriteBaseRecord(compacted, compactedEntries[0]);
             WriteLegacyReaderRejectionRecord(compacted);
@@ -787,6 +815,54 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         }
     }
 
+    /// <summary>
+    /// Creates an empty compacted log whose permissions are never broader than the log's: on Unix the file is created
+    /// with the log's permission bits (owner-only where the runtime cannot read them), so retained payloads are never
+    /// exposed and the replaced log keeps its access restrictions.
+    /// </summary>
+    private FileStream CreateCompactingLog()
+    {
+        // A file that already exists keeps its own permissions when reopened, so the compacted log is always created.
+        System.IO.File.Delete(_compactingLogPath);
+#if NET8_0_OR_GREATER
+        if (OperatingSystem.IsWindows())
+        {
+            return new FileStream(_compactingLogPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        }
+
+        UnixFileMode permissions = System.IO.File.GetUnixFileMode(_logStream.SafeFileHandle) & PermissionBits;
+        var stream = new FileStream(
+            _compactingLogPath,
+            new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                UnixCreateMode = permissions,
+            });
+        try
+        {
+            // The creation mode is narrowed by the umask; restore the log's exact permissions before any payload.
+            System.IO.File.SetUnixFileMode(stream.SafeFileHandle, permissions);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+
+        return stream;
+#else
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return new FileStream(_compactingLogPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        }
+
+        OwnerOnlyFile.Create(_compactingLogPath);
+        return new FileStream(_compactingLogPath, FileMode.Open, FileAccess.Write, FileShare.None);
+#endif
+    }
+
     private static void WriteLegacyReaderRejectionRecord(Stream stream)
     {
         // Older readers ignore BaseRecord. They interpret this otherwise-invalid compaction index as an error rather
@@ -816,13 +892,18 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 
     private void SyncLogDirectory()
     {
+        _syncDirectory(Path.GetDirectoryName(_logPath)!);
+    }
+
+    private static void SyncDirectoryDurably(string directoryPath)
+    {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             // Windows exposes no supported directory fsync equivalent through the .NET file APIs.
             return;
         }
 
-        DirectorySync.Sync(Path.GetDirectoryName(_logPath)!);
+        DirectorySync.Sync(directoryPath);
     }
 
     private void ResetLogFile()
@@ -957,6 +1038,49 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         [DllImport("libSystem.B.dylib", EntryPoint = "close", SetLastError = true)]
         private static extern int CloseMac(int descriptor);
     }
+
+#if !NET8_0_OR_GREATER
+    private static class OwnerOnlyFile
+    {
+        private const int OwnerReadWrite = 0x180;
+
+        public static void Create(string path)
+        {
+            int descriptor = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
+                ? CreateMac(path, OwnerReadWrite)
+                : CreateUnix(path, OwnerReadWrite);
+            if (descriptor < 0)
+            {
+                throw CreateIOException("create", path, Marshal.GetLastWin32Error());
+            }
+
+            int closeResult = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
+                ? CloseMac(descriptor)
+                : CloseUnix(descriptor);
+            if (closeResult != 0)
+            {
+                throw CreateIOException("close", path, Marshal.GetLastWin32Error());
+            }
+        }
+
+        private static IOException CreateIOException(string operation, string path, int error)
+        {
+            return new IOException($"Unable to {operation} compacted log '{path}' (errno {error}).");
+        }
+
+        [DllImport("libc", EntryPoint = "creat", SetLastError = true)]
+        private static extern int CreateUnix(string path, int mode);
+
+        [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+        private static extern int CloseUnix(int descriptor);
+
+        [DllImport("libSystem.B.dylib", EntryPoint = "creat", SetLastError = true)]
+        private static extern int CreateMac(string path, int mode);
+
+        [DllImport("libSystem.B.dylib", EntryPoint = "close", SetLastError = true)]
+        private static extern int CloseMac(int descriptor);
+    }
+#endif
 
     private List<Entry> CreateCompactedEntries(ulong compactIndex)
     {

@@ -283,6 +283,146 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task Reopen_WithFsync_SyncsDirectoryLeftUnsyncedByAnInterruptedReplacement()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            bool failDirectorySync = false;
+            using (var storage = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = true },
+                _ =>
+                {
+                    if (failDirectorySync)
+                    {
+                        throw new IOException("The process stopped before the directory sync.");
+                    }
+                }))
+            {
+                storage.Append(CreateEntries(1, 5));
+                failDirectorySync = true;
+                await Assert.That(Capture(() => storage.Compact(3)) is IOException).IsTrue();
+            }
+
+            var syncedDirectories = new List<string>();
+            using var reopened = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = true },
+                syncedDirectories.Add);
+
+            await Assert.That(syncedDirectories.Count).IsEqualTo(1);
+            await Assert.That(Path.GetFullPath(syncedDirectories[0])).IsEqualTo(Path.GetFullPath(directory));
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
+
+            reopened.Append(CreateEntries(6, 1));
+            await Assert.That(reopened.LastIndex()).IsEqualTo(6UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Reopen_WithFsync_RefusesWritesWhenTheDirectorySyncFails()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 5));
+                storage.Compact(3);
+            }
+
+            Exception? failure = Capture(() => new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = true },
+                _ => throw new IOException("The directory sync failed.")).Dispose());
+            await Assert.That(failure is IOException).IsTrue();
+
+            // The failed open released the log, so a later open can sync the directory and take writes.
+            var syncedDirectories = new List<string>();
+            using var reopened = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = true },
+                syncedDirectories.Add);
+            reopened.Append(CreateEntries(6, 1));
+
+            await Assert.That(syncedDirectories.Count).IsEqualTo(1);
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(6UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Reopen_WithoutFsync_DoesNotSyncDirectory()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var syncedDirectories = new List<string>();
+            using (var storage = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = false },
+                syncedDirectories.Add))
+            {
+                storage.Append(CreateEntries(1, 5));
+                storage.Compact(3);
+            }
+
+            using var reopened = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = false },
+                syncedDirectories.Add);
+
+            await Assert.That(syncedDirectories.Count).IsEqualTo(0);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    [Arguments(0b110_000_000)]
+    [Arguments(0b110_100_000)]
+    public async Task Compact_OnUnix_KeepsTheLogPermissions(int mode)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows log files carry ACLs that File.Replace keeps; Unix permission bits do not apply.
+            return;
+        }
+
+        string directory = CreateDirectory();
+        try
+        {
+            var permissions = (UnixFileMode)mode;
+            string logPath = Path.Combine(directory, "log");
+            string compactingPath = Path.Combine(directory, "log.compact");
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            storage.Append(CreateEntries(1, 5));
+            System.IO.File.SetUnixFileMode(logPath, permissions);
+
+            // A leftover compacted log with broader permissions must not be reused for the retained payloads.
+            System.IO.File.WriteAllBytes(compactingPath, Array.Empty<byte>());
+            System.IO.File.SetUnixFileMode(
+                compactingPath,
+                permissions | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+
+            storage.Compact(3);
+
+            await Assert.That(System.IO.File.GetUnixFileMode(logPath)).IsEqualTo(permissions);
+            await Assert.That(System.IO.File.Exists(compactingPath)).IsFalse();
+            await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task ApplySnapshot_InstallsBoundaryAndMatchesMemoryStorage()
     {
         string directory = CreateDirectory();
