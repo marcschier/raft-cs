@@ -148,7 +148,7 @@ public sealed class FileRaftStorageTests
             {
                 storage.Append(CreateEntries(1, 4));
                 storage.CreateSnapshot(2, snapshotConfState, new byte[] { 2 });
-                storage.SetConfState(currentConfState, 3);
+                storage.SetConfState(currentConfState);
             }
 
             using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
@@ -174,7 +174,7 @@ public sealed class FileRaftStorageTests
             using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
             storage.Append(CreateEntries(1, 2));
             storage.SetHardState(new HardState(2, 1, 2));
-            storage.SetConfState(confState, 2);
+            storage.SetConfState(confState);
 
             Snapshot fallback = storage.Snapshot(2);
 
@@ -268,6 +268,83 @@ public sealed class FileRaftStorageTests
             using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
             await Assert.That(reopened.InitialState().ConfState.Equals(bootstrap)).IsTrue();
             await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)0);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task SetConfState_WithoutIndex_LeavesTheIndexUnknown_AcrossReopen()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var one = new Configuration.ConfState(OneVoter);
+            var two = new Configuration.ConfState(TwoVoters);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.SetConfState(two, 3);
+                storage.SetConfState(one);
+                await Assert.That(storage.ConfStateIndex()).IsNull();
+            }
+
+            using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                await Assert.That(reopened.InitialState().ConfState.Equals(one)).IsTrue();
+                await Assert.That(reopened.ConfStateIndex()).IsNull();
+                reopened.SetConfState(two, 5);
+            }
+
+            using (var indexed = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                await Assert.That(indexed.InitialState().ConfState.Equals(two)).IsTrue();
+                await Assert.That(indexed.ConfStateIndex()).IsEqualTo((ulong?)5);
+                indexed.SetConfState(one);
+            }
+
+            using var unknown = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(unknown.InitialState().ConfState.Equals(one)).IsTrue();
+            await Assert.That(unknown.ConfStateIndex()).IsNull();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task TornConfStateRecord_ThenSetConfStateWithoutIndex_ReopensWithAnUnknownIndex()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var bootstrap = new Configuration.ConfState(TwoVoters);
+            var one = new Configuration.ConfState(OneVoter);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.SetConfState(bootstrap, 0);
+                storage.SetConfState(one, 5);
+            }
+
+            // The process stopped while the configuration after the index record was being written.
+            string logPath = Path.Combine(directory, "log");
+            using (var log = new FileStream(logPath, FileMode.Open, FileAccess.Write))
+            {
+                log.SetLength(log.Length - 1);
+            }
+
+            // The orphaned index record must not be paired with the next configuration, stored without an index.
+            using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                reopened.SetConfState(one);
+                await Assert.That(reopened.ConfStateIndex()).IsNull();
+            }
+
+            using var recovered = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(recovered.InitialState().ConfState.Equals(one)).IsTrue();
+            await Assert.That(recovered.ConfStateIndex()).IsNull();
         }
         finally
         {

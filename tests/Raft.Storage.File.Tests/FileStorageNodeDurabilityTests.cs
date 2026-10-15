@@ -20,7 +20,7 @@ public sealed class FileStorageNodeDurabilityTests
 
             using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
             {
-                storage.SetConfState(new ConfState(new ulong[] { 1 }), 0);
+                storage.SetConfState(new ConfState(new ulong[] { 1 }));
                 var node = new RaftNode(
                     new RaftConfig { Id = 1, RandomizedElectionTimeout = 5 },
                     storage,
@@ -77,7 +77,7 @@ public sealed class FileStorageNodeDurabilityTests
             var before = new List<CommittedItem>();
             using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
             {
-                storage.SetConfState(new ConfState(new ulong[] { 1 }), 0);
+                storage.SetConfState(new ConfState(new ulong[] { 1 }));
                 await using var network = new InMemoryNetwork();
                 RaftNode node = CreateNode(storage, network);
                 try
@@ -154,7 +154,7 @@ public sealed class FileStorageNodeDurabilityTests
                     entries[i] = new Entry(EntryType.Normal, 1, (ulong)i + 1, new byte[] { (byte)i });
                 }
 
-                storage.SetConfState(new ConfState(new ulong[] { 1 }), 0);
+                storage.SetConfState(new ConfState(new ulong[] { 1 }));
                 storage.Append(entries);
                 storage.SetHardState(new HardState(1, 1, 10));
                 storage.CreateSnapshot(4, new ConfState(new ulong[] { 1 }), new byte[] { 4 });

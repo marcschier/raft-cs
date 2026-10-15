@@ -16,6 +16,7 @@ public sealed class RaftNode : IAsyncDisposable
 {
     private readonly RaftCore _core;
     private readonly IRaftWritableStorage _storage;
+    private readonly IRaftConfStateIndexStorage? _confStateIndexStorage;
     private readonly IRaftSnapshotStorage? _snapshotStorage;
     private readonly Raft.Transport.IRaftTransport _transport;
     private readonly Raft.Transport.IRaftBatchTransport? _batchTransport;
@@ -69,6 +70,7 @@ public sealed class RaftNode : IAsyncDisposable
         Internal.Check.NotNull(transport);
 
         _storage = storage;
+        _confStateIndexStorage = storage as IRaftConfStateIndexStorage;
         _snapshotStorage = storage as IRaftSnapshotStorage;
         _transport = transport;
         _batchTransport = transport as Raft.Transport.IRaftBatchTransport;
@@ -677,15 +679,16 @@ public sealed class RaftNode : IAsyncDisposable
             baselineIndex = restored.Metadata.Index;
             replayConfigurationChangesAfter = baselineIndex;
         }
-        else if (_storage.ConfStateIndex() is { } storedIndex)
+        else if (_confStateIndexStorage?.ConfStateIndex() is { } storedIndex)
         {
             baselineIndex = storedIndex;
             replayConfigurationChangesAfter = baselineIndex;
         }
         else
         {
-            // The store does not record the index of its configuration: use it only from the latest committed
-            // configuration entry (or the commit index when none remains), and replay no recovered change.
+            // The store does not record the index of its configuration (it does not implement
+            // IRaftConfStateIndexStorage, or the index is unknown): use it only from the latest committed configuration
+            // entry (or the commit index when none remains), and replay no recovered change.
             baselineIndex = LatestCommittedConfigurationIndex();
             replayConfigurationChangesAfter = ulong.MaxValue;
         }
@@ -749,7 +752,14 @@ public sealed class RaftNode : IAsyncDisposable
                 _confState = next;
                 _confHistory.Add(new KeyValuePair<ulong, ConfState>(entry.Index, next));
                 _core.ApplyConfChange(next);
-                _storage.SetConfState(next, entry.Index);
+                if (_confStateIndexStorage is not null)
+                {
+                    _confStateIndexStorage.SetConfState(next, entry.Index);
+                }
+                else
+                {
+                    _storage.SetConfState(next);
+                }
 
                 // Surface the committed membership so consumers can reconcile against it.
                 if (publishConfiguration)

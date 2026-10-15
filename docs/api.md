@@ -59,8 +59,9 @@ Apply committed conf-change entries by computing the new `ConfState` (via `Chang
 | Type | Description |
 | --- | --- |
 | `IRaftStorage` | Read side: `InitialState`, `Entries`, `Term`, `FirstIndex`, `LastIndex`, `Snapshot`. |
-| `IRaftWritableStorage` | Adds `Append`, `ApplySnapshot`, `Compact`, `SetHardState`, `SetConfState` (the committed membership with the index of the last configuration change it reflects; zero to bootstrap), and `ConfStateIndex`. A restarting node replays only the committed configuration changes after that index. |
+| `IRaftWritableStorage` | Adds `Append`, `ApplySnapshot`, `Compact`, `SetHardState`, `SetConfState`. |
 | `IRaftSnapshotStorage` | Adds `CreateSnapshot` (application state at an index, keeping the log after it) and `LatestSnapshot`. Implemented by both built-in stores. |
+| `IRaftConfStateIndexStorage` | Optional. Adds `SetConfState(confState, index)`, which stores the committed membership with the index of the last configuration change it reflects (zero for the bootstrap membership), and `ConfStateIndex()`, which returns that index, or `null` when it is unknown (membership stored with the one-argument `SetConfState`). A restarting `RaftNode` without a snapshot to restore replays the committed configuration changes after that index; over any other store, or when the index is unknown, it replays none. Implemented by both built-in stores; `new MemoryStorage(confState)` records its membership at index 0. |
 | `MemoryStorage` | Volatile in-memory store (package `RaftCs`). |
 | `FileRaftStorage` / `FileRaftStorageOptions` | Crash-safe file (WAL) store (package `RaftCs.Storage.File`). |
 

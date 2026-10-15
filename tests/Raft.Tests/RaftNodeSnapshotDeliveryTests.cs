@@ -151,7 +151,7 @@ public sealed class RaftNodeSnapshotDeliveryTests
         });
         storage.SetHardState(new HardState(1, 0, 2));
         storage.CreateSnapshot(1, initial, new byte[] { 1 });
-        storage.SetConfState(latest, 2);
+        storage.SetConfState(latest);
 
         RaftNode node = CreateSingleNode(network, storage);
         try
@@ -189,7 +189,7 @@ public sealed class RaftNodeSnapshotDeliveryTests
         });
         storage.SetHardState(new HardState(1, 0, 2));
         storage.CreateSnapshot(1, initial, new byte[] { 1 });
-        storage.SetConfState(latest, 2);
+        storage.SetConfState(latest);
 
         RaftNode node = CreateSingleNode(network, storage);
         try
@@ -220,7 +220,7 @@ public sealed class RaftNodeSnapshotDeliveryTests
             new Entry(EntryType.ConfChangeV2, 1, 2, change.Encode()),
         });
         storage.SetHardState(new HardState(1, 0, 2));
-        storage.SetConfState(latest, 2);
+        storage.SetConfState(latest);
 
         RaftNode node = CreateSingleNode(network, storage);
         try

@@ -8,13 +8,15 @@ namespace Raft.Storage;
 /// A volatile, thread-safe <see cref="IRaftStorage"/> kept entirely in memory. It mirrors the raft-rs
 /// <c>MemStorage</c>: a sentinel entry at index 0 of the buffer represents the compacted snapshot boundary.
 /// </summary>
-public sealed class MemoryStorage : IRaftSnapshotStorage
+public sealed class MemoryStorage : IRaftSnapshotStorage, IRaftConfStateIndexStorage
 {
     private readonly object _gate = new();
     private readonly List<Entry> _entries = new() { default };
     private HardState _hardState;
     private SnapshotMetadata _snapshotMetadata;
-    private ulong _confStateIndex;
+
+    // The constructor's membership is the bootstrap membership, so it is recorded at index zero.
+    private ulong? _confStateIndex = 0;
     private Snapshot? _snapshot;
 
     /// <summary>Initializes a new instance of the <see cref="MemoryStorage"/> class with no initial members.</summary>
@@ -49,17 +51,21 @@ public sealed class MemoryStorage : IRaftSnapshotStorage
         }
     }
 
+    /// <summary>
+    /// Overwrites the persisted committed configuration. The index it reflects becomes unknown:
+    /// <see cref="ConfStateIndex"/> returns <see langword="null"/> until the next
+    /// <see cref="SetConfState(ConfState, ulong)"/> or snapshot installation.
+    /// </summary>
+    /// <param name="confState">The configuration to store.</param>
+    public void SetConfState(ConfState confState)
+    {
+        SetConfStateCore(confState, null);
+    }
+
     /// <inheritdoc/>
     public void SetConfState(ConfState confState, ulong index)
     {
-        lock (_gate)
-        {
-            _snapshotMetadata = new SnapshotMetadata(
-                _snapshotMetadata.Index,
-                _snapshotMetadata.Term,
-                confState ?? new ConfState());
-            _confStateIndex = index;
-        }
+        SetConfStateCore(confState, index);
     }
 
     /// <inheritdoc/>
@@ -322,4 +328,16 @@ public sealed class MemoryStorage : IRaftSnapshotStorage
     }
 
     private ulong LastIndexLocked() => _entries[0].Index + (ulong)_entries.Count - 1;
+
+    private void SetConfStateCore(ConfState confState, ulong? index)
+    {
+        lock (_gate)
+        {
+            _snapshotMetadata = new SnapshotMetadata(
+                _snapshotMetadata.Index,
+                _snapshotMetadata.Term,
+                confState ?? new ConfState());
+            _confStateIndex = index;
+        }
+    }
 }

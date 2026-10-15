@@ -225,7 +225,7 @@ internal sealed class RaftHarness
                 ConfState next = Changer.Apply(node.ConfState, change);
                 node.ConfState = next;
                 core.ApplyConfChange(next);
-                node.Storage.SetConfState(next, entry.Index);
+                node.Storage.SetConfState(next);
             }
 
             appliedTo = entry.Index;

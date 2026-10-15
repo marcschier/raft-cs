@@ -7,7 +7,7 @@ using Raft.Configuration;
 namespace Raft.Storage.File;
 
 /// <summary>A simple crash-safe file-backed implementation of <see cref="IRaftStorage"/>.</summary>
-public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
+public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexStorage, IDisposable
 {
     private const string LogFileName = "log";
     private const string HardStateFileName = "hardstate";
@@ -58,8 +58,16 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
 
         LoadSnapshot();
         LoadHardState();
-        ReplayLog(logPath);
+        long? danglingConfStateIndexRecord = ReplayLog(logPath);
         _logStream = new FileStream(logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        if (danglingConfStateIndexRecord is { } danglingStart)
+        {
+            // An index record whose configuration record was never written is the torn half of a pair. Drop it, so a
+            // configuration later written without an index is not paired with it on the next replay.
+            _logStream.SetLength(danglingStart);
+            FlushLog();
+        }
+
         _logStream.Seek(0, SeekOrigin.End);
     }
 
@@ -349,6 +357,26 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         }
     }
 
+    /// <summary>
+    /// Overwrites the persisted committed configuration. The index it reflects becomes unknown:
+    /// <see cref="ConfStateIndex"/> returns <see langword="null"/>, also after the store is reopened, until the next
+    /// <see cref="SetConfState(ConfState, ulong)"/> or snapshot installation.
+    /// </summary>
+    /// <param name="confState">The configuration to store.</param>
+    public void SetConfState(ConfState confState)
+    {
+        ThrowIfNull(confState);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            _confState = confState;
+            _confStateIndex = null;
+            WriteConfStateRecord(confState);
+            FlushLog();
+        }
+    }
+
     /// <inheritdoc/>
     public void SetConfState(ConfState confState, ulong index)
     {
@@ -557,15 +585,21 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         _hardState = new HardState(term, vote, commit);
     }
 
-    private void ReplayLog(string logPath)
+    /// <summary>
+    /// Replays the log records into memory; returns the offset of a trailing index record whose configuration record
+    /// is missing, or <see langword="null"/> when there is none.
+    /// </summary>
+    private long? ReplayLog(string logPath)
     {
         if (!System.IO.File.Exists(logPath))
         {
-            return;
+            return null;
         }
 
         using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         var lengthBuffer = new byte[LengthPrefixSize];
+        long? pendingConfStateIndexRecord = null;
+        long recordStart = stream.Position;
         while (ReadExactly(stream, lengthBuffer, 0, lengthBuffer.Length))
         {
             int length = BinaryPrimitives.ReadInt32BigEndian(lengthBuffer);
@@ -581,7 +615,12 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
             }
 
             ReplayRecord(payload);
+            pendingConfStateIndexRecord = _pendingConfStateIndex is null ? null : recordStart;
+            recordStart = stream.Position;
         }
+
+        _pendingConfStateIndex = null;
+        return pendingConfStateIndexRecord;
     }
 
     private static bool ReadExactly(Stream stream, byte[] buffer, int offset, int count)
@@ -651,7 +690,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
                     && confState is not null
                     && confStateOffset == payload.Length)
                 {
-                    // A configuration without a preceding index record was written before the index was recorded.
+                    // A configuration without an index record right before it was stored with an unknown index.
                     _confState = confState;
                     _confStateIndex = confStateIndex;
                 }
@@ -719,8 +758,9 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
     }
 
     /// <summary>
-    /// Writes the index record, then the configuration record it belongs to. A configuration record whose index record
-    /// is missing is one written before the index was recorded; one torn after the index record is ignored on replay.
+    /// Writes the index record, then the configuration record it belongs to. A configuration record without an index
+    /// record right before it has an unknown index; an index record without its configuration record is dropped on
+    /// open.
     /// </summary>
     private void WriteConfStateRecords(ConfState confState, ulong index)
     {
@@ -729,7 +769,11 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IDisposable
         int indexOffset = 1;
         WriteUInt64(indexPayload, ref indexOffset, index);
         WriteRecord(indexPayload);
+        WriteConfStateRecord(confState);
+    }
 
+    private void WriteConfStateRecord(ConfState confState)
+    {
         byte[] payload = new byte[1 + ConfStateLength(confState)];
         payload[0] = ConfStateRecord;
         int offset = 1;

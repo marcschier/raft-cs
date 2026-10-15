@@ -98,6 +98,22 @@ public sealed class MemoryStorageTests
     }
 
     [Test]
+    public async Task SetConfState_WithoutIndex_LeavesTheIndexUnknown()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        storage.SetConfState(new ConfState(new ulong[] { 1, 2 }), 4);
+
+        var confState = new ConfState(new ulong[] { 1, 2, 3 });
+        storage.SetConfState(confState);
+
+        await Assert.That(storage.ConfStateIndex()).IsNull();
+        await Assert.That(storage.InitialState().ConfState.Equals(confState)).IsTrue();
+
+        storage.SetConfState(confState, 7);
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)7);
+    }
+
+    [Test]
     public async Task ApplySnapshot_OlderThanCurrent_Throws()
     {
         var storage = new MemoryStorage();
