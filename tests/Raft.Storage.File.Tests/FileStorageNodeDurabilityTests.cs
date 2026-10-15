@@ -8,6 +8,22 @@ namespace Raft.Storage.File.Tests;
 
 public sealed class FileStorageNodeDurabilityTests
 {
+    private static readonly ConfState Initial = new(new ulong[] { 1, 2 });
+
+    private static readonly ConfChangeV2 EnterJointRemove2 = new(
+        new[] { new ConfChangeSingle(ConfChangeType.RemoveNode, 2) },
+        useJoint: true);
+
+    private static readonly ConfChangeV2 Leave = ConfChangeV2.LeaveJoint();
+
+    private static readonly ConfChangeV2 EnterJointAdd3 = new(
+        new[] { new ConfChangeSingle(ConfChangeType.AddNode, 3) },
+        useJoint: true);
+
+    private static readonly ConfState AfterJointChanges = Changer.Apply(
+        Changer.Apply(Changer.Apply(Initial, EnterJointRemove2), Leave),
+        EnterJointAdd3);
+
     [Test]
     public async Task SingleNode_CommitsViaAsyncWritesAndRecoversDurably()
     {
@@ -216,6 +232,131 @@ public sealed class FileStorageNodeDurabilityTests
                 Directory.Delete(directory, recursive: true);
             }
         }
+    }
+
+    [Test]
+    public async Task Restart_FromALegacyStore_DoesNotReapplyTheRecordedMembershipChanges()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "raft-node-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            // The files an earlier version left after committing and applying index 1 to 4: its SetConfState stored the
+            // membership after index 4 in a snapshot file at index zero.
+            var entries = new List<Entry> { new(EntryType.Normal, 1, 1, default) };
+            entries.AddRange(JointChangeEntries(2));
+            new LegacyStoreFormat.Log()
+                .Append(entries.ToArray())
+                .HardState(new HardState(1, 1, 4))
+                .WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 0, 0, AfterJointChanges);
+
+            await using var network = new InMemoryNetwork();
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                RaftNode node = CreateNode(storage, network);
+                try
+                {
+                    await Assert.That(node.AppliedIndex).IsEqualTo(4UL);
+                    await Assert.That(node.Configuration.Equals(AfterJointChanges)).IsTrue();
+                    await Assert.That(node.Configuration.VotersOutgoing.SequenceEqual(new ulong[] { 1 })).IsTrue();
+                }
+                finally
+                {
+                    await node.DisposeAsync();
+                }
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.InitialState().ConfState.Equals(AfterJointChanges)).IsTrue();
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task Restart_FromALegacyFollowerWithASnapshot_AppliesItsMembershipChangesOnce()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "raft-node-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            // An earlier version installed a snapshot at index 4 from the leader, then committed and applied the
+            // membership changes at index 5 to 7: its SetConfState rewrote the snapshot file with the membership after
+            // index 7, keeping index 4.
+            new LegacyStoreFormat.Log()
+                .HardState(new HardState(1, 0, 4))
+                .Append(JointChangeEntries(5))
+                .HardState(new HardState(1, 0, 7))
+                .WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 1, AfterJointChanges);
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await using (var network = new InMemoryNetwork())
+            {
+                using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+                RaftNode node = CreateNode(storage, network);
+                try
+                {
+                    await Assert.That(node.AppliedIndex).IsEqualTo(7UL);
+                    await Assert.That(node.Configuration.Equals(AfterJointChanges)).IsTrue();
+                    await Assert.That(node.Configuration.VotersOutgoing.SequenceEqual(new ulong[] { 1 })).IsTrue();
+
+                    // The first snapshot after the upgrade records the membership at its own index.
+                    await node.StartAsync(timeout.Token);
+                    SnapshotMetadata metadata = await node.CreateSnapshotAsync(7, new byte[] { 7 }, timeout.Token);
+                    await Assert.That(metadata.ConfState.Equals(AfterJointChanges)).IsTrue();
+                }
+                finally
+                {
+                    await node.DisposeAsync();
+                }
+            }
+
+            await using (var network = new InMemoryNetwork())
+            {
+                using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+                RaftNode node = CreateNode(storage, network);
+                try
+                {
+                    await node.StartAsync(timeout.Token);
+                    CommittedItem snapshot = await node.CommittedItems.ReadAsync(timeout.Token);
+                    await Assert.That(snapshot.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+                    await Assert.That(snapshot.Index).IsEqualTo(7UL);
+                    await Assert.That(node.Configuration.Equals(AfterJointChanges)).IsTrue();
+                }
+                finally
+                {
+                    await node.DisposeAsync();
+                }
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Entries that enter a joint configuration removing node 2, leave it, and enter a joint configuration adding
+    /// node 3. Re-applying the first two to the configuration after the third changes its outgoing voters.
+    /// </summary>
+    private static Entry[] JointChangeEntries(ulong first)
+    {
+        return new[]
+        {
+            new Entry(EntryType.ConfChangeV2, 1, first, EnterJointRemove2.Encode()),
+            new Entry(EntryType.ConfChangeV2, 1, first + 1, Leave.Encode()),
+            new Entry(EntryType.ConfChangeV2, 1, first + 2, EnterJointAdd3.Encode()),
+        };
     }
 
     private static RaftNode CreateNode(FileRaftStorage storage, InMemoryNetwork network)

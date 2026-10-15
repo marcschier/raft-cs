@@ -36,6 +36,11 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly List<KeyValuePair<ulong, ConfState>> _confHistory = new();
 
     private ConfState _confState;
+
+    // The log index up to which the recovered membership already reflects every committed configuration change. It
+    // holds until the applied index reaches it: the stored commit index can lag behind the stored membership, so
+    // entries up to it may still be applied after construction.
+    private ulong _replayConfigurationChangesAfter;
     private volatile ConfState _publishedConfState;
     private Task? _loop;
     private Task? _appendTask;
@@ -116,8 +121,8 @@ public sealed class RaftNode : IAsyncDisposable
         // Replay the whole committed suffix now, before inbox messages, ticks, or campaigns can observe the core. Only
         // the configuration changes after the recovered baseline are replayed: the ones at or before it are already
         // reflected in the recovered membership.
-        ulong replayConfigurationChangesAfter = RecoverConfigurationBaseline(restored);
-        while (ApplyCommitted(replayConfigurationChangesAfter, publishConfiguration: false))
+        _replayConfigurationChangesAfter = RecoverConfigurationBaseline(restored);
+        while (ApplyCommitted(publishConfiguration: false))
         {
             // Each pass applies one size-capped batch of the recovered entries.
         }
@@ -465,7 +470,9 @@ public sealed class RaftNode : IAsyncDisposable
             {
                 if (write.Snapshot is not null)
                 {
+                    // The snapshot's membership is the one at its own index: every later change is applied over it.
                     _confState = write.Snapshot.Metadata.ConfState;
+                    _replayConfigurationChangesAfter = 0;
                 }
 
                 _appendInFlight = true;
@@ -521,9 +528,9 @@ public sealed class RaftNode : IAsyncDisposable
 
     /// <summary>
     /// Applies the next batch of committed entries; returns whether there was one. Configuration changes at or before
-    /// <paramref name="replayConfigurationChangesAfter"/> are already reflected in the membership and are skipped.
+    /// the recovered cutoff are already reflected in the membership and are skipped.
     /// </summary>
-    private bool ApplyCommitted(ulong replayConfigurationChangesAfter = 0, bool publishConfiguration = true)
+    private bool ApplyCommitted(bool publishConfiguration = true)
     {
         IReadOnlyList<Entry> toApply = _core.NextEntriesToApply();
         if (toApply.Count == 0)
@@ -535,7 +542,7 @@ public sealed class RaftNode : IAsyncDisposable
         List<CommittedItem>? commands = null;
         foreach (Entry entry in toApply)
         {
-            if (ApplyEntry(entry, replayConfigurationChangesAfter, publishConfiguration) is { } command)
+            if (ApplyEntry(entry, publishConfiguration) is { } command)
             {
                 (commands ??= new List<CommittedItem>(toApply.Count)).Add(command);
             }
@@ -544,6 +551,10 @@ public sealed class RaftNode : IAsyncDisposable
         }
 
         _core.AppliedTo(appliedTo);
+        if (_core.Applied >= _replayConfigurationChangesAfter)
+        {
+            _replayConfigurationChangesAfter = 0;
+        }
 
         // AppliedIndex covers every item before a consumer can read it, so the consumer may compact at that index.
         Interlocked.Exchange(ref _appliedIndex, (long)_core.Applied);
@@ -690,7 +701,7 @@ public sealed class RaftNode : IAsyncDisposable
             // IRaftConfStateIndexStorage, or the index is unknown): use it only from the latest committed configuration
             // entry (or the commit index when none remains), and replay no recovered change.
             baselineIndex = LatestCommittedConfigurationIndex();
-            replayConfigurationChangesAfter = ulong.MaxValue;
+            replayConfigurationChangesAfter = _core.CommitIndex;
         }
 
         _confHistory.Add(new KeyValuePair<ulong, ConfState>(baselineIndex, _confState));
@@ -728,7 +739,7 @@ public sealed class RaftNode : IAsyncDisposable
     }
 
     /// <summary>Applies one committed entry; returns the item to queue for a non-empty command.</summary>
-    private CommittedItem? ApplyEntry(Entry entry, ulong replayConfigurationChangesAfter, bool publishConfiguration)
+    private CommittedItem? ApplyEntry(Entry entry, bool publishConfiguration)
     {
         switch (entry.Type)
         {
@@ -742,7 +753,7 @@ public sealed class RaftNode : IAsyncDisposable
 
             case EntryType.ConfChange:
             case EntryType.ConfChangeV2:
-                if (entry.Index <= replayConfigurationChangesAfter)
+                if (entry.Index <= _replayConfigurationChangesAfter)
                 {
                     break;
                 }

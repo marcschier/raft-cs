@@ -122,7 +122,17 @@ public sealed class RaftNodeSnapshotDeliveryTests
             }
 
             Task<SnapshotMetadata> snapshot = node.CreateSnapshotAsync(3, new byte[] { 3 });
-            Task compact = node.CompactAsync(5);
+            Task compact;
+            try
+            {
+                compact = node.CompactAsync(5);
+            }
+            catch (ArgumentOutOfRangeException ex)
+            {
+                // The loop recorded the snapshot before CompactAsync checked it: the caller-side check refuses.
+                compact = Task.FromException(ex);
+            }
+
             await snapshot;
 
             await Assert.That(async () => await compact).Throws<ArgumentOutOfRangeException>();

@@ -1,6 +1,7 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
 using Raft.Configuration;
+using Raft.Messages;
 using Raft.Storage;
 using Raft.Transport;
 
@@ -92,6 +93,55 @@ public sealed class RaftNodeMembershipRecoveryTests
             await Assert.That(node.Configuration.Equals(latest)).IsTrue();
             await Assert.That(node.Configuration.VotersOutgoing.SequenceEqual(new ulong[] { 1 })).IsTrue();
             await Assert.That(storage.InitialState().ConfState.Equals(latest)).IsTrue();
+        }
+        finally
+        {
+            await node.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task Restart_WithTheMembershipAheadOfTheStoredCommit_DoesNotReapplyItsChangesLater()
+    {
+        await using var network = new InMemoryNetwork();
+        ConfState latest = Changer.Apply(
+            Changer.Apply(Changer.Apply(Initial, EnterJointRemove2), Leave),
+            EnterJointAdd3);
+        MemoryStorage storage = CreateCommittedLog();
+
+        // The membership after index 4 was recorded, but the process stopped before the commit of index 4 was durable.
+        storage.SetHardState(new HardState(1, 0, 1));
+        storage.SetConfState(latest, 4);
+
+        RaftNode node = new(
+            new RaftConfig { Id = 1, RandomizedElectionTimeout = 1000 },
+            storage,
+            network.CreateNode(1),
+            new RaftNodeOptions { TickInterval = TimeSpan.FromMilliseconds(10) });
+        IRaftTransport leader = network.CreateNode(3);
+        try
+        {
+            await Assert.That(node.AppliedIndex).IsEqualTo(1UL);
+            await Assert.That(node.Configuration.Equals(latest)).IsTrue();
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await leader.StartAsync(timeout.Token);
+            await node.StartAsync(timeout.Token);
+
+            // The leader reports the commit of index 4: the node applies index 2 to 4 after its construction.
+            var heartbeat = new Message { Type = MessageType.Heartbeat, From = 3, To = 1, Term = 2, Commit = 4 };
+            byte[] frame = new byte[MessageCodec.EncodedLength(heartbeat)];
+            MessageCodec.TryWrite(heartbeat, frame);
+            await leader.SendAsync(1, frame, timeout.Token);
+            while (node.AppliedIndex < 4)
+            {
+                await Task.Delay(10, timeout.Token);
+            }
+
+            await Assert.That(node.Configuration.Equals(latest)).IsTrue();
+            await Assert.That(node.Configuration.VotersOutgoing.SequenceEqual(new ulong[] { 1 })).IsTrue();
+            await Assert.That(storage.InitialState().ConfState.Equals(latest)).IsTrue();
+            await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)4);
         }
         finally
         {

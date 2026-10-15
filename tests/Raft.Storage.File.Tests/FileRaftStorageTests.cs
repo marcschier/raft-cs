@@ -353,6 +353,243 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task LegacySnapshotFileAtIndexZero_ReopensWithAnUnknownIndex()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            // SetConfState of earlier versions stored the membership in a snapshot file at index zero.
+            var confState = new Configuration.ConfState(OneVoter, OneLearner);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 0, 0, confState);
+
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(storage.InitialState().ConfState.Equals(confState)).IsTrue();
+            await Assert.That(storage.ConfStateIndex()).IsNull();
+            await Assert.That(storage.LatestSnapshot()).IsNull();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task LegacySnapshotFile_HasAnUnknownMembershipIndex_AndIsNotServed()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            // An earlier version installed a snapshot at index 4 and later stored the membership after index 6 in it.
+            var latest = new Configuration.ConfState(OneVoter, OneLearner);
+            new LegacyStoreFormat.Log()
+                .HardState(new HardState(4, 0, 4))
+                .Append(CreateEntries(5, 2))
+                .HardState(new HardState(6, 0, 6))
+                .WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 4, latest);
+
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(storage.InitialState().ConfState.Equals(latest)).IsTrue();
+            await Assert.That(storage.ConfStateIndex()).IsNull();
+            await Assert.That(storage.LatestSnapshot()).IsNull();
+            await Assert.That(storage.FirstIndex()).IsEqualTo(5UL);
+            await AssertEntriesEqual(storage.Entries(5, 7, ulong.MaxValue), CreateEntries(5, 2));
+
+            // Its membership is not the one at index 4, so a follower is sent the membership at the commit index.
+            Snapshot served = storage.Snapshot(4);
+            await Assert.That(served.Metadata.Index).IsEqualTo(6UL);
+            await Assert.That(served.Metadata.ConfState.Equals(latest)).IsTrue();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task CreateSnapshot_ReplacesALegacySnapshotFile_AndKeepsTheCurrentMembership()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var latest = new Configuration.ConfState(OneVoter, OneLearner);
+            var atSix = new Configuration.ConfState(TwoVoters);
+            new LegacyStoreFormat.Log()
+                .HardState(new HardState(4, 0, 4))
+                .Append(CreateEntries(5, 3))
+                .HardState(new HardState(7, 0, 7))
+                .WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 4, latest);
+
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                Snapshot created = storage.CreateSnapshot(6, atSix, new byte[] { 6 });
+                await Assert.That(storage.LatestSnapshot()).IsSameReferenceAs(created);
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            Snapshot? snapshot = reopened.LatestSnapshot();
+            await Assert.That(snapshot).IsNotNull();
+            await Assert.That(snapshot!.Metadata.Index).IsEqualTo(6UL);
+            await Assert.That(snapshot.Metadata.ConfState.Equals(atSix)).IsTrue();
+            await Assert.That(reopened.InitialState().ConfState.Equals(latest)).IsTrue();
+            await Assert.That(reopened.ConfStateIndex()).IsNull();
+            await AssertEntriesEqual(reopened.Entries(7, 8, ulong.MaxValue), CreateEntries(7, 1));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task ApplySnapshot_ReplacesALegacySnapshotFile()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var installed = new Configuration.ConfState(TwoVoters, OneLearner);
+            new LegacyStoreFormat.Log()
+                .HardState(new HardState(4, 0, 4))
+                .Append(CreateEntries(5, 2))
+                .WriteTo(directory);
+            LegacyStoreFormat.WriteSnapshotFile(directory, 4, 4, new Configuration.ConfState(OneVoter));
+
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.ApplySnapshot(new Snapshot(new SnapshotMetadata(9, 9, installed), new byte[] { 9 }));
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            Snapshot? snapshot = reopened.LatestSnapshot();
+            await Assert.That(snapshot).IsNotNull();
+            await Assert.That(snapshot!.Metadata.Index).IsEqualTo(9UL);
+            await Assert.That(snapshot.Metadata.ConfState.Equals(installed)).IsTrue();
+            await Assert.That(reopened.InitialState().ConfState.Equals(installed)).IsTrue();
+            await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)9);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task SnapshotFile_ReadsUnchangedWithTheEarlierReader()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var confState = new Configuration.ConfState(TwoVoters, OneLearner, OneVoter, Array.Empty<ulong>(), true);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 4));
+                storage.CreateSnapshot(3, confState, new byte[] { 1, 2, 3 });
+            }
+
+            bool read = LegacyStoreFormat.TryReadSnapshotFile(
+                directory,
+                out ulong index,
+                out ulong term,
+                out byte[] data,
+                out Configuration.ConfState? legacyConfState);
+
+            await Assert.That(read).IsTrue();
+            await Assert.That(index).IsEqualTo(3UL);
+            await Assert.That(term).IsEqualTo(3UL);
+            await Assert.That(data.SequenceEqual(new byte[] { 1, 2, 3 })).IsTrue();
+            await Assert.That(legacyConfState!.Equals(confState)).IsTrue();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Reopen_RefusesASnapshotWithAnUnknownFormatMarker()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 4));
+                storage.CreateSnapshot(3, new Configuration.ConfState(TwoVoters), new byte[] { 3 });
+            }
+
+            string snapshotPath = Path.Combine(directory, "snapshot");
+            byte[] file = System.IO.File.ReadAllBytes(snapshotPath);
+            file[file.Length - 1]++;
+            System.IO.File.WriteAllBytes(snapshotPath, file);
+
+            await Assert.That(() => new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+                .Throws<InvalidDataException>();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task TornLastRecord_OfEveryKind_IsDroppedBeforeTheNextWrite()
+    {
+        var baselineHardState = new HardState(2, 1, 3);
+        var baselineConfState = new Configuration.ConfState(TwoVoters);
+        var tornWrites = new (string Kind, Action<FileRaftStorage> Write)[]
+        {
+            ("entry", storage => storage.Append(CreateEntries(4, 1))),
+            ("hard state", storage => storage.SetHardState(new HardState(5, 1, 4))),
+            ("compaction", storage => storage.Compact(2)),
+            ("indexed configuration", storage => storage.SetConfState(new Configuration.ConfState(OneVoter), 3)),
+            ("configuration without index", storage => storage.SetConfState(new Configuration.ConfState(OneVoter))),
+        };
+
+        foreach ((string kind, Action<FileRaftStorage> tornWrite) in tornWrites)
+        {
+            string directory = CreateDirectory();
+            try
+            {
+                string logPath = Path.Combine(directory, "log");
+                using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+                {
+                    storage.Append(CreateEntries(1, 3));
+                    storage.SetHardState(baselineHardState);
+                    storage.SetConfState(baselineConfState, 2);
+                }
+
+                byte[] intact = System.IO.File.ReadAllBytes(logPath);
+                using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+                {
+                    tornWrite(storage);
+                }
+
+                byte[] written = System.IO.File.ReadAllBytes(logPath);
+                for (int cut = intact.Length + 1; cut < written.Length; cut++)
+                {
+                    try
+                    {
+                        // The process stopped after the first cut bytes of the write reached the disk.
+                        System.IO.File.WriteAllBytes(logPath, written.AsSpan(0, cut).ToArray());
+                        long intactLength = IntactLength(written, intact.Length, cut);
+                        await ReopenTornLogAndWriteAgain(
+                            directory, intactLength, baselineHardState, baselineConfState);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new InvalidOperationException($"Torn {kind} record cut at byte {cut}.", ex);
+                    }
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+    }
+
+    [Test]
     public async Task CreateSnapshot_WithFsync_PublishesItDurably()
     {
         string directory = CreateDirectory();
@@ -617,6 +854,70 @@ public sealed class FileRaftStorageTests
         {
             DeleteDirectory(directory);
         }
+    }
+
+    /// <summary>
+    /// Returns the end of the last complete record of <paramref name="log"/> within its first <paramref name="cut"/>
+    /// bytes, from <paramref name="start"/> on; an index record counts only with the configuration record after it.
+    /// </summary>
+    private static long IntactLength(byte[] log, int start, int cut)
+    {
+        const byte confStateIndexRecord = 5;
+        long intactLength = start;
+        int offset = start;
+        while (offset + 4 <= cut)
+        {
+            int length = BinaryPrimitives.ReadInt32BigEndian(log.AsSpan(offset));
+            if (offset + 4 + length > cut)
+            {
+                break;
+            }
+
+            if (log[offset + 4] != confStateIndexRecord)
+            {
+                intactLength = offset + 4 + length;
+            }
+
+            offset += 4 + length;
+        }
+
+        return intactLength;
+    }
+
+    /// <summary>
+    /// Reopens a store whose log ends in a torn write, checks that only the intact log remains and the torn write
+    /// changed nothing, writes again, and checks that the new writes survive the next reopen.
+    /// </summary>
+    private static async Task ReopenTornLogAndWriteAgain(
+        string directory,
+        long intactLength,
+        HardState baselineHardState,
+        Configuration.ConfState baselineConfState)
+    {
+        var acknowledgedHardState = new HardState(7, 1, 5);
+        var acknowledgedConfState = new Configuration.ConfState(TwoVoters, OneLearner);
+        using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+        {
+            await Assert.That(new FileInfo(Path.Combine(directory, "log")).Length).IsEqualTo(intactLength);
+            await Assert.That(reopened.InitialState().HardState).IsEqualTo(baselineHardState);
+            await Assert.That(reopened.InitialState().ConfState.Equals(baselineConfState)).IsTrue();
+            await Assert.That(reopened.ConfStateIndex()).IsEqualTo((ulong?)2);
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(1UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(3UL);
+            await AssertEntriesEqual(reopened.Entries(1, 4, ulong.MaxValue), CreateEntries(1, 3));
+
+            reopened.Append(CreateEntries(4, 2));
+            reopened.SetHardState(acknowledgedHardState);
+            reopened.SetConfState(acknowledgedConfState, 5);
+        }
+
+        using var recovered = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+        await Assert.That(recovered.InitialState().HardState).IsEqualTo(acknowledgedHardState);
+        await Assert.That(recovered.InitialState().ConfState.Equals(acknowledgedConfState)).IsTrue();
+        await Assert.That(recovered.ConfStateIndex()).IsEqualTo((ulong?)5);
+        await Assert.That(recovered.FirstIndex()).IsEqualTo(1UL);
+        await Assert.That(recovered.LastIndex()).IsEqualTo(5UL);
+        await AssertEntriesEqual(recovered.Entries(1, 6, ulong.MaxValue), CreateEntries(1, 5));
     }
 
     private static Entry[] CreateEntries(ulong start, int count)

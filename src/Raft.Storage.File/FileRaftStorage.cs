@@ -24,6 +24,13 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
     private const int HardStateRecordSize = 1 + (3 * 8);
     private const int UInt64Size = 8;
 
+    // Ends a snapshot file whose membership is the one at the snapshot's index. Earlier versions wrote no marker and
+    // rewrote the snapshot file with the latest membership on every SetConfState, keeping the snapshot's index.
+    private static readonly byte[] PointInTimeMembershipMarker =
+    {
+        (byte)'R', (byte)'S', (byte)'P', (byte)'M', 0, 0, 0, 1,
+    };
+
     private readonly object _gate = new();
     private readonly string _hardStatePath;
     private readonly string _snapshotPath;
@@ -37,6 +44,9 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
     private ConfState _confState = new();
     private ulong? _confStateIndex = 0;
     private ulong? _pendingConfStateIndex;
+
+    // The snapshot file was written by an earlier version: its membership is the latest one, not the one at its index.
+    private bool _legacySnapshotFile;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -58,13 +68,14 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
 
         LoadSnapshot();
         LoadHardState();
-        long? danglingConfStateIndexRecord = ReplayLog(logPath);
+        long intactLength = ReplayLog(logPath);
         _logStream = new FileStream(logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        if (danglingConfStateIndexRecord is { } danglingStart)
+        if (_logStream.Length > intactLength)
         {
-            // An index record whose configuration record was never written is the torn half of a pair. Drop it, so a
-            // configuration later written without an index is not paired with it on the next replay.
-            _logStream.SetLength(danglingStart);
+            // The bytes after the intact log are the torn last write: an incomplete record, or an index record whose
+            // configuration record is missing. Drop them, so the next record starts where a replay reads it and an
+            // index record is not paired with a configuration later written without an index.
+            _logStream.SetLength(intactLength);
             FlushLog();
         }
 
@@ -158,7 +169,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         lock (_gate)
         {
             ThrowIfDisposed();
-            if (!_snapshot.IsEmpty && requestIndex <= _snapshot.Metadata.Index)
+            if (!_snapshot.IsEmpty && !_legacySnapshotFile && requestIndex <= _snapshot.Metadata.Index)
             {
                 return _snapshot;
             }
@@ -287,6 +298,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         }
 
         WriteSnapshot(snapshot);
+        _legacySnapshotFile = false;
         ResetLogFile();
         _snapshot = CopySnapshot(snapshot);
         _confState = snapshot.Metadata.ConfState;
@@ -314,7 +326,23 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
 
             ulong term = TermLocked(index);
             var snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), data.ToArray());
+            if (_legacySnapshotFile)
+            {
+                // The current membership is stored only in the snapshot file this one replaces; keep it in the log.
+                if (_confStateIndex is { } confStateIndex)
+                {
+                    WriteConfStateRecords(_confState, confStateIndex);
+                }
+                else
+                {
+                    WriteConfStateRecord(_confState);
+                }
+
+                FlushLog();
+            }
+
             WriteSnapshot(snapshot);
+            _legacySnapshotFile = false;
             _snapshot = snapshot;
             return snapshot;
         }
@@ -326,7 +354,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         lock (_gate)
         {
             ThrowIfDisposed();
-            return _snapshot.IsEmpty ? null : _snapshot;
+            return _snapshot.IsEmpty || _legacySnapshotFile ? null : _snapshot;
         }
     }
 
@@ -549,15 +577,26 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
 
         byte[] snapshotData = data.AsSpan(offset, dataLength).ToArray();
         offset += dataLength;
-        if (!TryReadConfState(data, ref offset, out ConfState? confState) || confState is null
-            || offset != data.Length)
+        if (!TryReadConfState(data, ref offset, out ConfState? confState) || confState is null)
+        {
+            throw DamagedSnapshot();
+        }
+
+        // Without the marker, an earlier version wrote the file: its membership is the latest one the store recorded,
+        // not the one at the snapshot's index, so the index that membership reflects is unknown.
+        ReadOnlySpan<byte> trailer = data.AsSpan(offset);
+        if (trailer.IsEmpty)
+        {
+            _legacySnapshotFile = true;
+        }
+        else if (!trailer.SequenceEqual(PointInTimeMembershipMarker))
         {
             throw DamagedSnapshot();
         }
 
         _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData);
         _confState = confState;
-        _confStateIndex = index;
+        _confStateIndex = _legacySnapshotFile ? null : index;
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, term, index, default));
     }
@@ -586,24 +625,25 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
     }
 
     /// <summary>
-    /// Replays the log records into memory; returns the offset of a trailing index record whose configuration record
-    /// is missing, or <see langword="null"/> when there is none.
+    /// Replays the log records into memory; returns the length of the intact log: the end of the last complete record,
+    /// before a trailing index record whose configuration record is missing.
     /// </summary>
-    private long? ReplayLog(string logPath)
+    private long ReplayLog(string logPath)
     {
         if (!System.IO.File.Exists(logPath))
         {
-            return null;
+            return 0;
         }
 
         using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        long fileLength = stream.Length;
         var lengthBuffer = new byte[LengthPrefixSize];
-        long? pendingConfStateIndexRecord = null;
-        long recordStart = stream.Position;
+        long intactLength = 0;
         while (ReadExactly(stream, lengthBuffer, 0, lengthBuffer.Length))
         {
+            // A record that does not fit in the file is the torn last write, and so may be its length prefix.
             int length = BinaryPrimitives.ReadInt32BigEndian(lengthBuffer);
-            if (length <= 0)
+            if (length <= 0 || length > fileLength - stream.Position)
             {
                 break;
             }
@@ -615,12 +655,16 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             }
 
             ReplayRecord(payload);
-            pendingConfStateIndexRecord = _pendingConfStateIndex is null ? null : recordStart;
-            recordStart = stream.Position;
+
+            // An index record is intact only together with the configuration record written right after it.
+            if (_pendingConfStateIndex is null)
+            {
+                intactLength = stream.Position;
+            }
         }
 
         _pendingConfStateIndex = null;
-        return pendingConfStateIndexRecord;
+        return intactLength;
     }
 
     private static bool ReadExactly(Stream stream, byte[] buffer, int offset, int count)
@@ -824,7 +868,8 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
 
     private void WriteSnapshot(Snapshot snapshot)
     {
-        int length = 8 + 8 + 4 + snapshot.Data.Length + ConfStateLength(snapshot.Metadata.ConfState);
+        int length = 8 + 8 + 4 + snapshot.Data.Length + ConfStateLength(snapshot.Metadata.ConfState)
+            + PointInTimeMembershipMarker.Length;
         byte[] data = new byte[length];
         int offset = 0;
         WriteUInt64(data, ref offset, snapshot.Metadata.Index);
@@ -834,6 +879,9 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         snapshot.Data.Span.CopyTo(data.AsSpan(offset));
         offset += snapshot.Data.Length;
         WriteConfState(data, ref offset, snapshot.Metadata.ConfState);
+
+        // After every field an earlier version reads, which ignores the bytes that follow.
+        PointInTimeMembershipMarker.CopyTo(data, offset);
 
         // Written beside the snapshot and then swapped in, so after a crash either the former or the new snapshot is
         // in place.
