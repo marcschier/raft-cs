@@ -32,7 +32,7 @@ Raft separates a **deterministic consensus core** from the **I/O that drives it*
 `IRaftStorage` is the read side (the raft-rs `Storage` trait analog); `IRaftWritableStorage` adds append/compact/snapshot/hard-state writes used by the driver. Two implementations ship:
 
 - **`MemoryStorage`** — volatile, with a sentinel entry marking the compacted boundary.
-- **`FileRaftStorage`** (package `RaftCs.Storage.File`) — a crash-safe append-only WAL plus hard-state and snapshot files, replayed on open and tolerant of a torn trailing record. `Compact` rewrites the WAL to the retained entries (written beside it, then swapped in), so the file stays bounded.
+- **`FileRaftStorage`** (package `RaftCs.Storage.File`) — a crash-safe append-only WAL plus hard-state and snapshot files, replayed on open and tolerant of a torn trailing record. `Compact` stages the retained WAL beside the current file and swaps it in only after the staged write succeeds, so a failed rewrite leaves the current in-memory and persisted log retryable. With `Fsync` enabled on Unix, it also syncs the containing directory after the swap before accepting another write.
 
 ## Membership — joint consensus
 

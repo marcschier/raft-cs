@@ -194,6 +194,62 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task Compact_RewriteFailurePreservesEntriesAndCanRetry()
+    {
+        string directory = CreateDirectory();
+        string compactingPath = Path.Combine(directory, "log.compact");
+        try
+        {
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            storage.Append(CreateEntries(1, 5));
+
+            Directory.CreateDirectory(compactingPath);
+            Exception? failure = Capture(() => storage.Compact(3));
+
+            await Assert.That(failure is not null).IsTrue();
+            await Assert.That(storage.FirstIndex()).IsEqualTo(1UL);
+            await Assert.That(storage.LastIndex()).IsEqualTo(5UL);
+            await AssertEntriesEqual(storage.Entries(1, 6, ulong.MaxValue), CreateEntries(1, 5));
+
+            Directory.Delete(compactingPath);
+            storage.Compact(3);
+
+            await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+            await Assert.That(storage.LastIndex()).IsEqualTo(5UL);
+            await AssertEntriesEqual(storage.Entries(4, 6, ulong.MaxValue), CreateEntries(4, 2));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Compact_WithFsync_PersistsReplacementBeforeSubsequentAppend()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = true }))
+            {
+                storage.Append(CreateEntries(1, 5));
+                storage.Compact(3);
+                storage.Append(CreateEntries(6, 2));
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = true });
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(7UL);
+            await Assert.That(reopened.Term(3)).IsEqualTo(3UL);
+            await AssertEntriesEqual(reopened.Entries(4, 8, ulong.MaxValue), CreateEntries(4, 4));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task ApplySnapshot_InstallsBoundaryAndMatchesMemoryStorage()
     {
         string directory = CreateDirectory();

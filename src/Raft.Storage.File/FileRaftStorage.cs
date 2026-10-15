@@ -1,6 +1,7 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using Raft.Configuration;
 
 namespace Raft.Storage.File;
@@ -33,6 +34,8 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private FileStream _logStream;
     private HardState _hardState;
     private Snapshot _snapshot = new(new SnapshotMetadata(0, 0, new ConfState()), ReadOnlyMemory<byte>.Empty);
+    private bool _logWritable;
+    private bool _replacementNeedsDirectorySync;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -56,6 +59,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         LoadHardState();
         ReplayLog(_logPath);
         _logStream = OpenLog();
+        _logWritable = true;
     }
 
     /// <inheritdoc/>
@@ -176,6 +180,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
+            EnsureLogWritable();
             if (AppendToLogLocked(entries))
             {
                 FlushLog();
@@ -195,6 +200,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
+            EnsureLogWritable();
 
             if (snapshot is not null)
             {
@@ -261,6 +267,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
+            EnsureLogWritable();
             ApplySnapshotLocked(snapshot);
         }
     }
@@ -294,9 +301,8 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            Entry boundary = CompactCore(compactIndex);
-            _entries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
-            RewriteLog();
+            EnsureLogWritable();
+            RewriteLog(CreateCompactedEntries(compactIndex));
         }
     }
 
@@ -307,6 +313,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
+            EnsureLogWritable();
             _hardState = hardState;
             WriteHardStateRecord(hardState);
             FlushLog();
@@ -322,6 +329,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
+            EnsureLogWritable();
             SnapshotMetadata metadata = _snapshot.Metadata;
             _snapshot = new Snapshot(new SnapshotMetadata(metadata.Index, metadata.Term, confState), _snapshot.Data);
             WriteSnapshot(_snapshot);
@@ -701,31 +709,93 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     /// Replaces the log file with one that holds only the retained log: the compaction boundary, the entries after it,
     /// and the hard state.
     /// </summary>
-    private void RewriteLog()
+    private void RewriteLog(List<Entry> compactedEntries)
     {
         using (var compacted = new FileStream(
             _compactingLogPath, FileMode.Create, FileAccess.Write, FileShare.None))
         {
-            WriteBaseRecord(compacted, _entries[0]);
-            for (int i = 1; i < _entries.Count; i++)
+            WriteBaseRecord(compacted, compactedEntries[0]);
+            for (int i = 1; i < compactedEntries.Count; i++)
             {
-                WriteEntryRecord(compacted, _entries[i]);
+                WriteEntryRecord(compacted, compactedEntries[i]);
             }
 
             WriteHardStateRecord(compacted, _hardState);
             compacted.Flush(_fsync);
         }
 
-        // The log is closed while it is replaced, and reopened whether or not the replacement succeeded.
         _logStream.Dispose();
+        _logWritable = false;
         try
         {
             System.IO.File.Replace(_compactingLogPath, _logPath, destinationBackupFileName: null);
         }
-        finally
+        catch (Exception replacementException)
+        {
+            try
+            {
+                _logStream = OpenLog();
+                _logWritable = true;
+            }
+            catch (Exception reopenException)
+            {
+                throw new InvalidOperationException(
+                    "The log replacement failed and the original log could not be reopened.",
+                    new AggregateException(replacementException, reopenException));
+            }
+
+            throw;
+        }
+
+        _entries.Clear();
+        _entries.AddRange(compactedEntries);
+
+        if (_fsync)
+        {
+            _replacementNeedsDirectorySync = true;
+            SyncLogDirectory();
+            _replacementNeedsDirectorySync = false;
+        }
+
+        try
         {
             _logStream = OpenLog();
+            _logWritable = true;
         }
+        catch (Exception reopenException)
+        {
+            throw new InvalidOperationException(
+                "The compacted log was replaced but could not be reopened for writes.",
+                reopenException);
+        }
+    }
+
+    private void EnsureLogWritable()
+    {
+        if (_logWritable)
+        {
+            return;
+        }
+
+        if (_replacementNeedsDirectorySync)
+        {
+            SyncLogDirectory();
+            _replacementNeedsDirectorySync = false;
+        }
+
+        _logStream = OpenLog();
+        _logWritable = true;
+    }
+
+    private void SyncLogDirectory()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            // Windows exposes no supported directory fsync equivalent through the .NET file APIs.
+            return;
+        }
+
+        DirectorySync.Sync(Path.GetDirectoryName(_logPath)!);
     }
 
     private void ResetLogFile()
@@ -801,6 +871,84 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         {
             _entries.RemoveRange(truncateAt, _entries.Count - truncateAt);
         }
+    }
+
+    private static class DirectorySync
+    {
+        private const int ReadOnly = 0;
+
+        public static void Sync(string path)
+        {
+            int descriptor = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
+                ? OpenMac(path, ReadOnly)
+                : OpenUnix(path, ReadOnly);
+            if (descriptor < 0)
+            {
+                throw CreateIOException("open", path, Marshal.GetLastWin32Error());
+            }
+
+            int syncResult = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
+                ? FsyncMac(descriptor)
+                : FsyncUnix(descriptor);
+            int syncError = Marshal.GetLastWin32Error();
+            int closeResult = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
+                ? CloseMac(descriptor)
+                : CloseUnix(descriptor);
+            int closeError = Marshal.GetLastWin32Error();
+            if (syncResult != 0)
+            {
+                throw CreateIOException("fsync", path, syncError);
+            }
+
+            if (closeResult != 0)
+            {
+                throw CreateIOException("close", path, closeError);
+            }
+        }
+
+        private static IOException CreateIOException(string operation, string path, int error)
+        {
+            return new IOException(
+                $"Unable to {operation} log directory '{path}' (errno {error}).");
+        }
+
+        [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+        private static extern int OpenUnix(string path, int flags);
+
+        [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
+        private static extern int FsyncUnix(int descriptor);
+
+        [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+        private static extern int CloseUnix(int descriptor);
+
+        [DllImport("libSystem.B.dylib", EntryPoint = "open", SetLastError = true)]
+        private static extern int OpenMac(string path, int flags);
+
+        [DllImport("libSystem.B.dylib", EntryPoint = "fsync", SetLastError = true)]
+        private static extern int FsyncMac(int descriptor);
+
+        [DllImport("libSystem.B.dylib", EntryPoint = "close", SetLastError = true)]
+        private static extern int CloseMac(int descriptor);
+    }
+
+    private List<Entry> CreateCompactedEntries(ulong compactIndex)
+    {
+        ulong offset = _entries[0].Index;
+        if (compactIndex <= offset)
+        {
+            throw new RaftStorageException(RaftStorageError.Compacted);
+        }
+
+        if (compactIndex > LastIndexLocked())
+        {
+            throw new RaftStorageException(RaftStorageError.Unavailable);
+        }
+
+        int cut = (int)(compactIndex - offset);
+        Entry boundary = _entries[cut];
+        var compactedEntries = _entries.GetRange(cut, _entries.Count - cut);
+        compactedEntries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
+        return compactedEntries;
     }
 
     private Entry CompactCore(ulong compactIndex)
