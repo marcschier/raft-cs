@@ -1,5 +1,7 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
+using System.Buffers.Binary;
+
 namespace Raft.Storage.File.Tests;
 
 public sealed class FileRaftStorageTests
@@ -127,6 +129,37 @@ public sealed class FileRaftStorageTests
                 reopened.Entries(151, 206, ulong.MaxValue),
                 CreateEntries(151, 55, payloadLength: 256));
             await AssertStorageError(() => reopened.Entries(150, 151, ulong.MaxValue), RaftStorageError.Compacted);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Compact_PreviousReaderRejectsCompactedLog()
+    {
+        string directory = CreateDirectory();
+        string logPath = Path.Combine(directory, "log");
+        try
+        {
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 10));
+                storage.Compact(3);
+            }
+
+            using (var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
+                await Assert.That(reopened.LastIndex()).IsEqualTo(10UL);
+                await Assert.That(reopened.Term(3)).IsEqualTo(3UL);
+            }
+
+            Exception? exception = Capture(() => PreviousFileRaftStorageReader.Open(logPath));
+            var storageException = exception as RaftStorageException;
+            await Assert.That(storageException is not null).IsTrue();
+            await Assert.That(storageException!.Error).IsEqualTo(RaftStorageError.Compacted);
         }
         finally
         {
@@ -534,6 +567,152 @@ public sealed class FileRaftStorageTests
         if (Directory.Exists(directory))
         {
             Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private sealed class PreviousFileRaftStorageReader
+    {
+        private const byte EntryRecord = 0;
+        private const byte TruncateRecord = 1;
+        private const byte CompactRecord = 2;
+        private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
+        private const int UInt64Size = 8;
+
+        private readonly List<Entry> _entries = new() { default };
+
+        public static PreviousFileRaftStorageReader Open(string path)
+        {
+            var reader = new PreviousFileRaftStorageReader();
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var lengthBuffer = new byte[sizeof(int)];
+            while (ReadExactly(stream, lengthBuffer))
+            {
+                int length = BinaryPrimitives.ReadInt32BigEndian(lengthBuffer);
+                if (length <= 0)
+                {
+                    break;
+                }
+
+                var payload = new byte[length];
+                if (!ReadExactly(stream, payload))
+                {
+                    break;
+                }
+
+                reader.ReplayRecord(payload);
+            }
+
+            return reader;
+        }
+
+        private void ReplayRecord(ReadOnlySpan<byte> payload)
+        {
+            switch (payload[0])
+            {
+                case EntryRecord:
+                    ReplayEntryRecord(payload);
+                    break;
+                case TruncateRecord:
+                    if (payload.Length == 1 + UInt64Size)
+                    {
+                        TruncateForAppend(ReadUInt64(payload.Slice(1)));
+                    }
+
+                    break;
+                case CompactRecord:
+                    if (payload.Length == 1 + UInt64Size)
+                    {
+                        CompactCore(ReadUInt64(payload.Slice(1)));
+                    }
+
+                    break;
+            }
+        }
+
+        private void ReplayEntryRecord(ReadOnlySpan<byte> payload)
+        {
+            if (payload.Length < EntryHeaderSize)
+            {
+                return;
+            }
+
+            int offset = 2;
+            ulong term = ReadUInt64(payload.Slice(offset));
+            offset += UInt64Size;
+            ulong index = ReadUInt64(payload.Slice(offset));
+            offset += UInt64Size;
+            int dataLength = BinaryPrimitives.ReadInt32BigEndian(payload.Slice(offset));
+            offset += sizeof(int);
+            if (dataLength < 0 || payload.Length != offset + dataLength)
+            {
+                return;
+            }
+
+            AppendCore(new Entry((EntryType)payload[1], term, index, payload.Slice(offset, dataLength).ToArray()));
+        }
+
+        private void AppendCore(Entry entry)
+        {
+            ulong first = _entries[0].Index + 1;
+            if (entry.Index < first)
+            {
+                return;
+            }
+
+            TruncateForAppend(entry.Index);
+            _entries.Add(entry);
+        }
+
+        private void TruncateForAppend(ulong appendStart)
+        {
+            if (appendStart <= _entries[0].Index)
+            {
+                _entries.RemoveRange(1, _entries.Count - 1);
+                return;
+            }
+
+            int truncateAt = (int)(appendStart - _entries[0].Index);
+            if (truncateAt < _entries.Count)
+            {
+                _entries.RemoveRange(truncateAt, _entries.Count - truncateAt);
+            }
+        }
+
+        private void CompactCore(ulong compactIndex)
+        {
+            ulong offset = _entries[0].Index;
+            if (compactIndex <= offset)
+            {
+                throw new RaftStorageException(RaftStorageError.Compacted);
+            }
+
+            ulong lastIndex = offset + (ulong)_entries.Count - 1;
+            if (compactIndex > lastIndex)
+            {
+                throw new RaftStorageException(RaftStorageError.Unavailable);
+            }
+
+            _entries.RemoveRange(0, (int)(compactIndex - offset));
+        }
+
+        private static ulong ReadUInt64(ReadOnlySpan<byte> source) =>
+            BinaryPrimitives.ReadUInt64BigEndian(source);
+
+        private static bool ReadExactly(Stream stream, byte[] buffer)
+        {
+            int read = 0;
+            while (read < buffer.Length)
+            {
+                int count = stream.Read(buffer, read, buffer.Length - read);
+                if (count == 0)
+                {
+                    return false;
+                }
+
+                read += count;
+            }
+
+            return true;
         }
     }
 }

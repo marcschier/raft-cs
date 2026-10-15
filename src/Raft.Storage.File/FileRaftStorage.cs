@@ -36,6 +36,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private Snapshot _snapshot = new(new SnapshotMetadata(0, 0, new ConfState()), ReadOnlyMemory<byte>.Empty);
     private bool _logWritable;
     private bool _replacementNeedsDirectorySync;
+    private bool _expectsLegacyReaderRejectionRecord;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -557,6 +558,12 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 
     private void ReplayRecord(ReadOnlySpan<byte> payload)
     {
+        if (_expectsLegacyReaderRejectionRecord
+            && (payload[0] != CompactRecord || payload.Length != 1 + UInt64Size))
+        {
+            _expectsLegacyReaderRejectionRecord = false;
+        }
+
         switch (payload[0])
         {
             case EntryRecord:
@@ -576,6 +583,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                     int offset = 1;
                     ulong index = ReadUInt64(payload, ref offset);
                     ulong term = ReadUInt64(payload, ref offset);
+                    _expectsLegacyReaderRejectionRecord = true;
 
                     // A newer snapshot already covers a base at or below its index.
                     if (index > _entries[0].Index)
@@ -590,7 +598,15 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 if (payload.Length == 1 + UInt64Size)
                 {
                     int offset = 1;
-                    Entry boundary = CompactCore(ReadUInt64(payload, ref offset));
+                    ulong compactIndex = ReadUInt64(payload, ref offset);
+                    if (_expectsLegacyReaderRejectionRecord && compactIndex == 0)
+                    {
+                        _expectsLegacyReaderRejectionRecord = false;
+                        break;
+                    }
+
+                    _expectsLegacyReaderRejectionRecord = false;
+                    Entry boundary = CompactCore(compactIndex);
                     _entries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
                 }
 
@@ -715,6 +731,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             _compactingLogPath, FileMode.Create, FileAccess.Write, FileShare.None))
         {
             WriteBaseRecord(compacted, compactedEntries[0]);
+            WriteLegacyReaderRejectionRecord(compacted);
             for (int i = 1; i < compactedEntries.Count; i++)
             {
                 WriteEntryRecord(compacted, compactedEntries[i]);
@@ -768,6 +785,16 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 "The compacted log was replaced but could not be reopened for writes.",
                 reopenException);
         }
+    }
+
+    private static void WriteLegacyReaderRejectionRecord(Stream stream)
+    {
+        // Older readers ignore BaseRecord. They interpret this otherwise-invalid compaction index as an error rather
+        // than replaying retained entries with incorrect indexes.
+        Span<byte> payload = stackalloc byte[1 + UInt64Size];
+        payload[0] = CompactRecord;
+        payload.Slice(1).Clear();
+        WriteRecord(stream, payload);
     }
 
     private void EnsureLogWritable()
