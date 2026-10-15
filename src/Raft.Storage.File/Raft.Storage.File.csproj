@@ -18,4 +18,9 @@
     <ProjectReference Include="..\Raft\Raft.csproj" />
   </ItemGroup>
 
+  <!-- File ACLs are in-box on net8+; netstandard needs the package to create files with an explicit DACL. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' OR '$(TargetFramework)' == 'netstandard2.1'">
+    <PackageReference Include="System.IO.FileSystem.AccessControl" />
+  </ItemGroup>
+
 </Project>

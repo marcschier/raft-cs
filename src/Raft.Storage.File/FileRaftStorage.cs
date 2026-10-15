@@ -2,6 +2,10 @@
 
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
+#if NET8_0_OR_GREATER
+using System.Runtime.Versioning;
+#endif
+using System.Security.AccessControl;
 using Raft.Configuration;
 
 namespace Raft.Storage.File;
@@ -816,9 +820,9 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     }
 
     /// <summary>
-    /// Creates an empty compacted log whose permissions are never broader than the log's: on Unix the file is created
-    /// with the log's permission bits (owner-only where the runtime cannot read them), so retained payloads are never
-    /// exposed and the replaced log keeps its access restrictions.
+    /// Creates an empty compacted log whose permissions are never broader than the log's: on Windows the file is
+    /// created with the log's access rules, and on Unix with the log's permission bits (owner-only where the runtime
+    /// cannot read them), so retained payloads are never exposed and the replaced log keeps its access restrictions.
     /// </summary>
     private FileStream CreateCompactingLog()
     {
@@ -827,7 +831,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 #if NET8_0_OR_GREATER
         if (OperatingSystem.IsWindows())
         {
-            return new FileStream(_compactingLogPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            return CreateCompactingLogOnWindows();
         }
 
         UnixFileMode permissions = System.IO.File.GetUnixFileMode(_logStream.SafeFileHandle) & PermissionBits;
@@ -855,12 +859,31 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 #else
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return new FileStream(_compactingLogPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            return CreateCompactingLogOnWindows();
         }
 
         OwnerOnlyFile.Create(_compactingLogPath);
         return new FileStream(_compactingLogPath, FileMode.Open, FileAccess.Write, FileShare.None);
 #endif
+    }
+
+    /// <summary>
+    /// Creates the compacted log with the log's access rules in the same call that creates the file, so the retained
+    /// payloads are never readable under the directory's inherited rules.
+    /// </summary>
+#if NET8_0_OR_GREATER
+    [SupportedOSPlatform("windows")]
+#endif
+    private FileStream CreateCompactingLogOnWindows()
+    {
+        var logSecurity = new FileSecurity(_logPath, AccessControlSections.Access);
+        return new FileInfo(_compactingLogPath).Create(
+            FileMode.CreateNew,
+            FileSystemRights.Write,
+            FileShare.None,
+            bufferSize: 4096,
+            FileOptions.None,
+            logSecurity);
     }
 
     private static void WriteLegacyReaderRejectionRecord(Stream stream)

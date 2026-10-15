@@ -1,6 +1,9 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
 using System.Buffers.Binary;
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 
 namespace Raft.Storage.File.Tests;
 
@@ -419,6 +422,91 @@ public sealed class FileRaftStorageTests
         finally
         {
             DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    [Arguments(true)]
+    [Arguments(false)]
+    public async Task Compact_OnWindows_KeepsTheLogAccessRules(bool restrictLog)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            // Unix log files carry permission bits; Windows access rules do not apply.
+            return;
+        }
+
+        string directory = CreateDirectory();
+        try
+        {
+            string logPath = Path.Combine(directory, "log");
+            string compactingPath = Path.Combine(directory, "log.compact");
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 5));
+            }
+
+            if (restrictLog)
+            {
+                var restricted = new FileSecurity();
+                restricted.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+                restricted.AddAccessRule(new FileSystemAccessRule(
+                    WindowsIdentity.GetCurrent().User!,
+                    FileSystemRights.FullControl,
+                    AccessControlType.Allow));
+                new FileInfo(logPath).SetAccessControl(restricted);
+            }
+
+            string expected = AccessRules(logPath);
+            await Assert.That(expected.StartsWith("protected=True;", StringComparison.Ordinal)).IsEqualTo(restrictLog);
+
+            // A leftover compacted log with the directory's inherited rules must not be reused for the retained payloads.
+            System.IO.File.WriteAllBytes(compactingPath, Array.Empty<byte>());
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            reopened.Append(CreateEntries(6, 1));
+            using (new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                // The open handle refuses the replacement, so the staged compacted log stays for inspection.
+                await Assert.That(Capture(() => reopened.Compact(3)) is not null).IsTrue();
+            }
+
+            await Assert.That(AccessRules(compactingPath)).IsEqualTo(expected);
+
+            reopened.Compact(3);
+
+            await Assert.That(AccessRules(logPath)).IsEqualTo(expected);
+            await Assert.That(System.IO.File.Exists(compactingPath)).IsFalse();
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
+            await AssertEntriesEqual(reopened.Entries(4, 7, ulong.MaxValue), CreateEntries(4, 3));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+
+        [SupportedOSPlatform("windows")]
+        static string AccessRules(string path)
+        {
+            FileSecurity security = new FileInfo(path).GetAccessControl();
+
+            // File.Replace stores inherited rules as explicit copies, so the comparison covers the access granted.
+            var rules = new SortedSet<string>(StringComparer.Ordinal);
+            foreach (FileSystemAccessRule rule in security.GetAccessRules(
+                includeExplicit: true,
+                includeInherited: true,
+                typeof(SecurityIdentifier)))
+            {
+                rules.Add(string.Join(
+                    ",",
+                    rule.IdentityReference.Value,
+                    rule.AccessControlType,
+                    rule.FileSystemRights,
+                    rule.InheritanceFlags,
+                    rule.PropagationFlags));
+            }
+
+            return $"protected={security.AreAccessRulesProtected};{string.Join(";", rules)}";
         }
     }
 
