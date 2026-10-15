@@ -168,6 +168,75 @@ public sealed class RaftNodeCustomStorageTests
         await Assert.That(afterCommit.VotersOutgoing.SequenceEqual(new ulong[] { 1 })).IsTrue();
     }
 
+    [Test]
+    public async Task CreateSnapshotAsync_AfterAStorageWriteFailure_FailsInsteadOfWaiting()
+    {
+        var storage = new FailingWriteStorage(new ConfState(new ulong[] { 1 }));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var network = new InMemoryNetwork();
+        RaftNode node = CreateSingleNode(network, storage);
+        try
+        {
+            await StartLeaderAsync(node, timeout.Token);
+            storage.FailWrites();
+            Task proposal = node.ProposeAsync(Encoding.UTF8.GetBytes("x"), timeout.Token).AsTask();
+
+            Exception? committedFault = null;
+            try
+            {
+                await node.CommittedItems.Completion.WaitAsync(timeout.Token);
+            }
+            catch (IOException ex)
+            {
+                committedFault = ex;
+            }
+
+            await Assert.That(committedFault).IsNotNull();
+
+            // No caller token: before the fix the request sat in the inbox of the stopped loop forever.
+            Task<SnapshotMetadata> request = node.CreateSnapshotAsync(node.AppliedIndex, new byte[] { 1 });
+            Task finished = await Task.WhenAny(request, Task.Delay(TimeSpan.FromSeconds(10), timeout.Token));
+            await Assert.That(finished).IsSameReferenceAs(request);
+            InvalidOperationException? failure = null;
+            try
+            {
+                await request;
+            }
+            catch (InvalidOperationException ex)
+            {
+                failure = ex;
+            }
+
+            await Assert.That(failure?.InnerException).IsTypeOf<IOException>();
+        }
+        finally
+        {
+            try
+            {
+                await node.DisposeAsync();
+            }
+            catch (IOException)
+            {
+                // The storage failure also surfaces from disposal.
+            }
+        }
+    }
+
+    [Test]
+    public async Task DisposeAsync_BeforeStart_FailsQueuedRequests()
+    {
+        await using var network = new InMemoryNetwork();
+        RaftNode node = CreateSingleNode(network, new FailingWriteStorage(new ConfState(new ulong[] { 1 })));
+        Task request = node.CompactAsync(0);
+
+        await node.DisposeAsync();
+
+        Task finished = await Task.WhenAny(request, Task.Delay(TimeSpan.FromSeconds(10)));
+        await Assert.That(finished).IsSameReferenceAs(request);
+        await Assert.That(request.IsFaulted).IsTrue();
+        await Assert.That(request.Exception!.InnerException).IsTypeOf<ObjectDisposedException>();
+    }
+
     /// <summary>
     /// Stores the joint-change log with a snapshot at index 1, stores the membership after index 4 with
     /// <paramref name="storeMembership"/> while the stored commit is 1, restarts a node, and checks it keeps that
@@ -312,7 +381,7 @@ public sealed class RaftNodeCustomStorageTests
 
         public void SetHardState(HardState hardState) => Inner.SetHardState(hardState);
 
-        public void Write(IReadOnlyList<Entry> entries, HardState? hardState, Snapshot? snapshot) =>
+        public virtual void Write(IReadOnlyList<Entry> entries, HardState? hardState, Snapshot? snapshot) =>
             Inner.Write(entries, hardState, snapshot);
 
         public void SetConfState(ConfState confState)
@@ -320,6 +389,34 @@ public sealed class RaftNodeCustomStorageTests
             Interlocked.Increment(ref _setConfStateCalls);
             Inner.SetConfState(confState);
         }
+    }
+
+    /// <summary>A store whose writes fail once armed, to stop the node's driver loop.</summary>
+    private sealed class FailingWriteStorage : WritableOnlyStorage, IRaftSnapshotStorage
+    {
+        private volatile bool _failWrites;
+
+        public FailingWriteStorage(ConfState initialConfState)
+            : base(initialConfState)
+        {
+        }
+
+        public void FailWrites() => _failWrites = true;
+
+        public override void Write(IReadOnlyList<Entry> entries, HardState? hardState, Snapshot? snapshot)
+        {
+            if (_failWrites)
+            {
+                throw new IOException("The disk is gone.");
+            }
+
+            base.Write(entries, hardState, snapshot);
+        }
+
+        public Snapshot CreateSnapshot(ulong index, ConfState confState, ReadOnlyMemory<byte> data) =>
+            Inner.CreateSnapshot(index, confState, data);
+
+        public Snapshot? LatestSnapshot() => Inner.LatestSnapshot();
     }
 
     /// <summary>A third-party store that keeps snapshots but does not record the index of its configuration.</summary>

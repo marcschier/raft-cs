@@ -27,6 +27,9 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly Channel<RaftStateChange> _stateChanges;
     private readonly Channel<ConfState> _confChanges;
     private readonly CancellationTokenSource _stop = new();
+
+    // Why the driver loop stopped, when it was not disposal: a storage write failure or a loop fault.
+    private volatile Exception? _stopFault;
     private readonly SemaphoreSlim _startGate = new(1, 1);
     private readonly object _tickSignal = new();
 
@@ -375,6 +378,9 @@ public sealed class RaftNode : IAsyncDisposable
             }
         }
 
+        // The loop fails what it leaves queued; a node disposed before it started has no loop to do so.
+        FailPendingRequests();
+
         // Await any in-flight storage write so the worker has released the store before the caller disposes it.
         if (_appendTask is not null)
         {
@@ -442,7 +448,34 @@ public sealed class RaftNode : IAsyncDisposable
         catch (OperationCanceledException)
         {
         }
+        catch (Exception ex)
+        {
+            _stopFault ??= ex;
+            throw;
+        }
+        finally
+        {
+            FailPendingRequests();
+        }
     }
+
+    /// <summary>
+    /// Completes the requests the stopped loop will never handle, so their callers do not wait forever. Closing the
+    /// inbox first makes every later request fail at once in <see cref="EnqueueRequest{TResult}"/>.
+    /// </summary>
+    private void FailPendingRequests()
+    {
+        _inbox.Writer.TryComplete();
+        while (_inbox.Reader.TryRead(out object? item))
+        {
+            (item as IPendingRequest)?.Fail(StoppedException());
+        }
+    }
+
+    private Exception StoppedException() =>
+        _stopFault is { } fault
+            ? new InvalidOperationException("The node stopped after a failure.", fault)
+            : new ObjectDisposedException(nameof(RaftNode));
 
     private async Task ProcessReadyAsync(CancellationToken cancellationToken)
     {
@@ -512,6 +545,7 @@ public sealed class RaftNode : IAsyncDisposable
         {
             // A storage write failure is unrecoverable for consensus: surface it to the committed-command consumer and
             // stop the driver loop.
+            _stopFault = ex;
             _committed.Complete(ex);
             _stop.Cancel();
             return;
@@ -931,17 +965,25 @@ public sealed class RaftNode : IAsyncDisposable
 
         if (!_inbox.Writer.TryWrite(request))
         {
-            request.Completion.TrySetException(new ObjectDisposedException(nameof(RaftNode)));
+            request.Completion.TrySetException(StoppedException());
         }
 
         return request.Completion.Task;
     }
 
+    /// <summary>A queued request that can be failed without knowing its result type.</summary>
+    private interface IPendingRequest
+    {
+        void Fail(Exception exception);
+    }
+
     /// <summary>A request the driver loop runs, serialized with all other storage access.</summary>
-    private abstract class LoopRequest<TResult>
+    private abstract class LoopRequest<TResult> : IPendingRequest
     {
         internal TaskCompletionSource<TResult> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Fail(Exception exception) => Completion.TrySetException(exception);
     }
 
     /// <summary>Loop request to compact the log up to (and excluding) <see cref="Index"/>.</summary>
