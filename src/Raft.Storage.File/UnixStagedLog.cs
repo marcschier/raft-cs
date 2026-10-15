@@ -381,7 +381,20 @@ internal static unsafe class UnixStagedLog
     private static bool TryReadRuntimeStatus(int descriptor, out UnixFileStatus status)
     {
         byte* buffer = stackalloc byte[RuntimeStatusSize];
-        if (RuntimeFileStatus(descriptor, buffer) != 0)
+        int result;
+        try
+        {
+            result = RuntimeFileStatus(descriptor, buffer);
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            // Without the runtime's fstat the access cannot be compared, so the caller keeps the log and compacts
+            // logically instead of rewriting it.
+            status = default;
+            return false;
+        }
+
+        if (result != 0)
         {
             status = default;
             return false;
@@ -545,8 +558,9 @@ internal static unsafe class UnixStagedLog
     [DllImport("libSystem.B.dylib", EntryPoint = "acl_free", SetLastError = true)]
     private static extern int MacFreeAcl(nint acl);
 
-    // The runtime's fstat (what File.GetUnixFileMode calls), built for the process's libc and architecture.
-    [DllImport("libSystem.Native", EntryPoint = "SystemNative_FStat", SetLastError = true)]
+    // The runtime's fstat (what File.GetUnixFileMode calls), built for the process's libc and architecture. The
+    // canonical name lets NativeAOT bind it to the statically linked runtime library.
+    [DllImport("System.Native", EntryPoint = "SystemNative_FStat", SetLastError = true)]
     private static extern int RuntimeFileStatus(nint descriptor, byte* status);
 
 #if !NET8_0_OR_GREATER
