@@ -1,6 +1,7 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -9,8 +10,17 @@ namespace Raft.Storage.File.Tests;
 
 public sealed class FileRaftStorageTests
 {
+    private const uint DefaultAclUid = 4242;
+    private const uint LogAclUid = 4343;
     private static readonly ulong[] TwoVoters = { 1UL, 2UL };
     private static readonly ulong[] OneLearner = { 3UL };
+
+    public enum StagingPathOccupant
+    {
+        File,
+        LinkToFile,
+        DanglingLink,
+    }
 
     [Test]
     public async Task RoundTrip_AppendsAndReadsEntries()
@@ -511,6 +521,195 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task Compact_OnLinux_KeepsTheLogAccessControlListUnderADirectoryDefault(bool logHasAcl)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            // POSIX access control lists are copied on Linux only.
+            return;
+        }
+
+        string directory = CreateDirectoryWithDefaultAcl();
+        try
+        {
+            string logPath = Path.Combine(directory, "log");
+            string compactingPath = Path.Combine(directory, "log.compact");
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 5));
+                if (logHasAcl)
+                {
+                    PosixAcl.Set(
+                        logPath,
+                        PosixAcl.AccessName,
+                        PosixAcl.Create(
+                            (PosixAcl.UserObject, 6, PosixAcl.NoId),
+                            (PosixAcl.User, 4, LogAclUid),
+                            (PosixAcl.GroupObject, 4, PosixAcl.NoId),
+                            (PosixAcl.Mask, 4, PosixAcl.NoId),
+                            (PosixAcl.Other, 0, PosixAcl.NoId)));
+                }
+                else
+                {
+                    PosixAcl.Remove(logPath, PosixAcl.AccessName);
+                    System.IO.File.SetUnixFileMode(
+                        logPath,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+                }
+
+                byte[]? expectedAcl = PosixAcl.Get(logPath, PosixAcl.AccessName);
+                UnixFileMode expectedMode = System.IO.File.GetUnixFileMode(logPath);
+                await Assert.That(expectedAcl is not null).IsEqualTo(logHasAcl);
+
+                // The compacted log is created under the directory's default ACL and replaces the log in place.
+                storage.Compact(3);
+
+                byte[]? actualAcl = PosixAcl.Get(logPath, PosixAcl.AccessName);
+                await Assert.That(actualAcl is not null).IsEqualTo(logHasAcl);
+                if (expectedAcl is not null)
+                {
+                    await Assert.That(actualAcl!.AsSpan().SequenceEqual(expectedAcl)).IsTrue();
+                }
+
+                await Assert.That(System.IO.File.GetUnixFileMode(logPath)).IsEqualTo(expectedMode);
+                await Assert.That(System.IO.File.Exists(compactingPath)).IsFalse();
+                await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await AssertEntriesEqual(reopened.Entries(4, 6, ulong.MaxValue), CreateEntries(4, 2));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task CreateStagedLog_OnLinux_IsOwnerOnlyUnderADirectoryDefaultAcl()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            // POSIX access control lists are copied on Linux only.
+            return;
+        }
+
+        string directory = CreateDirectoryWithDefaultAcl();
+        try
+        {
+            string stagedPath = Path.Combine(directory, "log.compact");
+            using (FileStream staged = UnixStagedLog.Create(stagedPath))
+            {
+                // The group class bits are the inherited list's mask, so the user the default ACL names has no access.
+                await Assert.That(System.IO.File.GetUnixFileMode(stagedPath))
+                    .IsEqualTo(UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Compact_OnUnix_DoesNotWriteThroughALinkAtTheStagingPath()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // The Unix staging file is created exclusively; Windows creates it with the log's access rules.
+            return;
+        }
+
+        string directory = CreateDirectory();
+        string outside = CreateDirectory();
+        try
+        {
+            string compactingPath = Path.Combine(directory, "log.compact");
+            string targetPath = Path.Combine(outside, "target");
+            byte[] target = { 1, 2, 3 };
+            System.IO.File.WriteAllBytes(targetPath, target);
+            using var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            storage.Append(CreateEntries(1, 5));
+            System.IO.File.CreateSymbolicLink(compactingPath, targetPath);
+
+            storage.Compact(3);
+
+            await Assert.That(System.IO.File.ReadAllBytes(targetPath).AsSpan().SequenceEqual(target)).IsTrue();
+            await Assert.That(Directory.GetFileSystemEntries(directory).Contains(compactingPath)).IsFalse();
+            await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+            await AssertEntriesEqual(storage.Entries(4, 6, ulong.MaxValue), CreateEntries(4, 2));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+            DeleteDirectory(outside);
+        }
+    }
+
+    [Test]
+    [Arguments(StagingPathOccupant.File)]
+    [Arguments(StagingPathOccupant.LinkToFile)]
+    [Arguments(StagingPathOccupant.DanglingLink)]
+    public async Task CreateStagedLog_OnUnix_RefusesAnythingAtTheStagingPath(StagingPathOccupant occupant)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // The Unix staging file is created exclusively; Windows creates it with the log's access rules.
+            return;
+        }
+
+        string directory = CreateDirectory();
+        string outside = CreateDirectory();
+        try
+        {
+            string stagedPath = Path.Combine(directory, "log.compact");
+            string targetPath = Path.Combine(outside, "target");
+            byte[] target = { 1, 2, 3 };
+            switch (occupant)
+            {
+                case StagingPathOccupant.File:
+                    System.IO.File.WriteAllBytes(stagedPath, target);
+                    targetPath = stagedPath;
+                    break;
+                case StagingPathOccupant.LinkToFile:
+                    System.IO.File.WriteAllBytes(targetPath, target);
+                    System.IO.File.CreateSymbolicLink(stagedPath, targetPath);
+                    break;
+                default:
+                    System.IO.File.CreateSymbolicLink(stagedPath, targetPath);
+                    break;
+            }
+
+            Exception? exception = null;
+            try
+            {
+                UnixStagedLog.Create(stagedPath).Dispose();
+            }
+            catch (IOException ex)
+            {
+                exception = ex;
+            }
+
+            await Assert.That(exception is not null).IsTrue();
+            if (occupant == StagingPathOccupant.DanglingLink)
+            {
+                await Assert.That(System.IO.File.Exists(targetPath)).IsFalse();
+            }
+            else
+            {
+                await Assert.That(System.IO.File.ReadAllBytes(targetPath).AsSpan().SequenceEqual(target)).IsTrue();
+            }
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+            DeleteDirectory(outside);
+        }
+    }
+
+    [Test]
     public async Task ApplySnapshot_InstallsBoundaryAndMatchesMemoryStorage()
     {
         string directory = CreateDirectory();
@@ -790,12 +989,156 @@ public sealed class FileRaftStorageTests
         return directory;
     }
 
+    [SupportedOSPlatform("linux")]
+    private static string CreateDirectoryWithDefaultAcl()
+    {
+        string directory = CreateDirectory();
+
+        // New files inherit a grant to a user that the log's own access never names.
+        byte[] defaultAcl = PosixAcl.Create(
+            (PosixAcl.UserObject, 7, PosixAcl.NoId),
+            (PosixAcl.User, 6, DefaultAclUid),
+            (PosixAcl.GroupObject, 5, PosixAcl.NoId),
+            (PosixAcl.Mask, 7, PosixAcl.NoId),
+            (PosixAcl.Other, 5, PosixAcl.NoId));
+        if (!PosixAcl.TrySet(directory, PosixAcl.DefaultName, defaultAcl))
+        {
+            DeleteDirectory(directory);
+            Skip.Test("The temporary directory's file system does not support POSIX access control lists.");
+        }
+
+        return directory;
+    }
+
     private static void DeleteDirectory(string directory)
     {
         if (Directory.Exists(directory))
         {
             Directory.Delete(directory, recursive: true);
         }
+    }
+
+    [SupportedOSPlatform("linux")]
+    private static class PosixAcl
+    {
+        public const string AccessName = "system.posix_acl_access";
+        public const string DefaultName = "system.posix_acl_default";
+        public const ushort UserObject = 0x01;
+        public const ushort User = 0x02;
+        public const ushort GroupObject = 0x04;
+        public const ushort Mask = 0x10;
+        public const ushort Other = 0x20;
+        public const uint NoId = uint.MaxValue;
+        private const int Version = 2;
+        private const int NoData = 61;
+        private const int NotSupported = 95;
+        private const int Range = 34;
+
+        public static byte[] Create(params (ushort Tag, ushort Permissions, uint Id)[] entries)
+        {
+            byte[] acl = new byte[4 + (entries.Length * 8)];
+            BinaryPrimitives.WriteInt32LittleEndian(acl, Version);
+            for (int i = 0; i < entries.Length; i++)
+            {
+                Span<byte> entry = acl.AsSpan(4 + (i * 8));
+                BinaryPrimitives.WriteUInt16LittleEndian(entry, entries[i].Tag);
+                BinaryPrimitives.WriteUInt16LittleEndian(entry.Slice(2), entries[i].Permissions);
+                BinaryPrimitives.WriteUInt32LittleEndian(entry.Slice(4), entries[i].Id);
+            }
+
+            return acl;
+        }
+
+        public static bool TrySet(string path, string name, byte[] acl)
+        {
+            if (SetAttribute(path, name, acl, (nuint)acl.Length, 0) == 0)
+            {
+                return true;
+            }
+
+            int error = Marshal.GetLastPInvokeError();
+            if (error != NotSupported)
+            {
+                throw CreateException("set", name, path, error);
+            }
+
+            return false;
+        }
+
+        public static void Set(string path, string name, byte[] acl)
+        {
+            if (!TrySet(path, name, acl))
+            {
+                throw CreateException("set", name, path, NotSupported);
+            }
+        }
+
+        public static byte[]? Get(string path, string name)
+        {
+            while (true)
+            {
+                nint size = GetAttribute(path, name, null, 0);
+                if (size >= 0)
+                {
+                    byte[] value = new byte[(int)size];
+                    nint read = GetAttribute(path, name, value, (nuint)value.Length);
+                    if (read >= 0)
+                    {
+                        return value.AsSpan(0, (int)read).ToArray();
+                    }
+                }
+
+                int error = Marshal.GetLastPInvokeError();
+                if (error == NoData)
+                {
+                    return null;
+                }
+
+                if (error != Range)
+                {
+                    throw CreateException("get", name, path, error);
+                }
+            }
+        }
+
+        public static void Remove(string path, string name)
+        {
+            if (RemoveAttribute(path, name) == 0)
+            {
+                return;
+            }
+
+            int error = Marshal.GetLastPInvokeError();
+            if (error != NoData)
+            {
+                throw CreateException("remove", name, path, error);
+            }
+        }
+
+        private static IOException CreateException(string operation, string name, string path, int error)
+        {
+            return new IOException($"Unable to {operation} '{name}' on '{path}' (errno {error}).");
+        }
+
+        [DllImport("libc", EntryPoint = "getxattr", SetLastError = true)]
+        private static extern nint GetAttribute(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+            byte[]? value,
+            nuint size);
+
+        [DllImport("libc", EntryPoint = "setxattr", SetLastError = true)]
+        private static extern int SetAttribute(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+            byte[] value,
+            nuint size,
+            int flags);
+
+        [DllImport("libc", EntryPoint = "removexattr", SetLastError = true)]
+        private static extern int RemoveAttribute(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name);
     }
 
     private sealed class PreviousFileRaftStorageReader

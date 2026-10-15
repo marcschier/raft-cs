@@ -27,12 +27,6 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private const int HardStateRecordSize = 1 + (3 * 8);
     private const int BaseRecordSize = 1 + (2 * 8);
     private const int UInt64Size = 8;
-#if NET8_0_OR_GREATER
-    private const UnixFileMode PermissionBits =
-        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
-        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
-        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute;
-#endif
 
     private readonly object _gate = new();
     private readonly string _logPath;
@@ -770,6 +764,14 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             }
 
             WriteHardStateRecord(compacted, _hardState);
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                // Every payload is written while the compacted log is owner-only; only then does it get the log's
+                // access, before the sync and the replacement publish it.
+                compacted.Flush();
+                UnixStagedLog.ApplyLogAccess(_logStream.SafeFileHandle, compacted.SafeFileHandle, _compactingLogPath);
+            }
+
             compacted.Flush(_fsync);
         }
 
@@ -820,51 +822,21 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     }
 
     /// <summary>
-    /// Creates an empty compacted log whose permissions are never broader than the log's: on Windows the file is
-    /// created with the log's access rules, and on Unix with the log's permission bits (owner-only where the runtime
-    /// cannot read them), so retained payloads are never exposed and the replaced log keeps its access restrictions.
+    /// Creates an empty compacted log whose access is never broader than the log's: on Windows the file is created
+    /// with the log's access rules, and on Unix it is created exclusively and owner-only and gets the log's access
+    /// only after the retained payloads are written, so they are never exposed and the replaced log keeps its access
+    /// restrictions.
     /// </summary>
     private FileStream CreateCompactingLog()
     {
         // A file that already exists keeps its own permissions when reopened, so the compacted log is always created.
         System.IO.File.Delete(_compactingLogPath);
-#if NET8_0_OR_GREATER
-        if (OperatingSystem.IsWindows())
-        {
-            return CreateCompactingLogOnWindows();
-        }
-
-        UnixFileMode permissions = System.IO.File.GetUnixFileMode(_logStream.SafeFileHandle) & PermissionBits;
-        var stream = new FileStream(
-            _compactingLogPath,
-            new FileStreamOptions
-            {
-                Mode = FileMode.CreateNew,
-                Access = FileAccess.Write,
-                Share = FileShare.None,
-                UnixCreateMode = permissions,
-            });
-        try
-        {
-            // The creation mode is narrowed by the umask; restore the log's exact permissions before any payload.
-            System.IO.File.SetUnixFileMode(stream.SafeFileHandle, permissions);
-        }
-        catch
-        {
-            stream.Dispose();
-            throw;
-        }
-
-        return stream;
-#else
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             return CreateCompactingLogOnWindows();
         }
 
-        OwnerOnlyFile.Create(_compactingLogPath);
-        return new FileStream(_compactingLogPath, FileMode.Open, FileAccess.Write, FileShare.None);
-#endif
+        return UnixStagedLog.Create(_compactingLogPath);
     }
 
     /// <summary>
@@ -1061,49 +1033,6 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         [DllImport("libSystem.B.dylib", EntryPoint = "close", SetLastError = true)]
         private static extern int CloseMac(int descriptor);
     }
-
-#if !NET8_0_OR_GREATER
-    private static class OwnerOnlyFile
-    {
-        private const int OwnerReadWrite = 0x180;
-
-        public static void Create(string path)
-        {
-            int descriptor = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
-                ? CreateMac(path, OwnerReadWrite)
-                : CreateUnix(path, OwnerReadWrite);
-            if (descriptor < 0)
-            {
-                throw CreateIOException("create", path, Marshal.GetLastWin32Error());
-            }
-
-            int closeResult = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
-                ? CloseMac(descriptor)
-                : CloseUnix(descriptor);
-            if (closeResult != 0)
-            {
-                throw CreateIOException("close", path, Marshal.GetLastWin32Error());
-            }
-        }
-
-        private static IOException CreateIOException(string operation, string path, int error)
-        {
-            return new IOException($"Unable to {operation} compacted log '{path}' (errno {error}).");
-        }
-
-        [DllImport("libc", EntryPoint = "creat", SetLastError = true)]
-        private static extern int CreateUnix(string path, int mode);
-
-        [DllImport("libc", EntryPoint = "close", SetLastError = true)]
-        private static extern int CloseUnix(int descriptor);
-
-        [DllImport("libSystem.B.dylib", EntryPoint = "creat", SetLastError = true)]
-        private static extern int CreateMac(string path, int mode);
-
-        [DllImport("libSystem.B.dylib", EntryPoint = "close", SetLastError = true)]
-        private static extern int CloseMac(int descriptor);
-    }
-#endif
 
     private List<Entry> CreateCompactedEntries(ulong compactIndex)
     {
