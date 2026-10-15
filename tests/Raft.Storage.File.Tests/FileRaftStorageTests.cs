@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
 
 namespace Raft.Storage.File.Tests;
 
@@ -12,6 +13,7 @@ public sealed class FileRaftStorageTests
 {
     private const uint DefaultAclUid = 4242;
     private const uint LogAclUid = 4343;
+    private const int StatxNotImplemented = 38;
     private static readonly ulong[] TwoVoters = { 1UL, 2UL };
     private static readonly ulong[] OneLearner = { 3UL };
 
@@ -20,6 +22,13 @@ public sealed class FileRaftStorageTests
         File,
         LinkToFile,
         DanglingLink,
+    }
+
+    public enum StatxFailure
+    {
+        MissingSymbol,
+        NotImplemented,
+        Refused,
     }
 
     [Test]
@@ -614,6 +623,187 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    [Arguments(StatxFailure.MissingSymbol)]
+    [Arguments(StatxFailure.NotImplemented)]
+    [Arguments(StatxFailure.Refused)]
+    public async Task ReadStatus_OnLinux_WithoutStatx_MatchesStatx(StatxFailure failure)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            // statx and its fallback are Linux-only.
+            return;
+        }
+
+        string directory = CreateDirectory();
+        try
+        {
+            string path = Path.Combine(directory, "file");
+            using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write);
+            System.IO.File.SetUnixFileMode(
+                file.SafeFileHandle,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherExecute);
+            int calls = 0;
+
+            UnixFileStatus expected = UnixStagedLog.ReadStatus(file.SafeFileHandle, path, statx: null);
+            UnixFileStatus actual = UnixStagedLog.ReadStatus(
+                file.SafeFileHandle,
+                path,
+                FailingStatx(failure, () => calls++));
+
+            await Assert.That(calls).IsEqualTo(1);
+            await Assert.That(actual).IsEqualTo(expected);
+            await Assert.That(expected.Mode & 0x1FFu).IsEqualTo(0x1A1u);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    [Arguments(StatxFailure.MissingSymbol)]
+    [Arguments(StatxFailure.NotImplemented)]
+    [Arguments(StatxFailure.Refused)]
+    public async Task Compact_OnLinux_WithoutStatx_KeepsTheLogAccess(StatxFailure failure)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            // statx and its fallback are Linux-only.
+            return;
+        }
+
+        string directory = CreateDirectoryWithDefaultAcl();
+        try
+        {
+            string logPath = Path.Combine(directory, "log");
+            int calls = 0;
+            using var storage = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = false },
+                _ => { },
+                FailingStatx(failure, () => calls++));
+            storage.Append(CreateEntries(1, 5));
+            PosixAcl.Set(
+                logPath,
+                PosixAcl.AccessName,
+                PosixAcl.Create(
+                    (PosixAcl.UserObject, 6, PosixAcl.NoId),
+                    (PosixAcl.User, 4, LogAclUid),
+                    (PosixAcl.GroupObject, 4, PosixAcl.NoId),
+                    (PosixAcl.Mask, 4, PosixAcl.NoId),
+                    (PosixAcl.Other, 0, PosixAcl.NoId)));
+            byte[] expectedAcl = PosixAcl.Get(logPath, PosixAcl.AccessName)!;
+            UnixFileMode expectedMode = System.IO.File.GetUnixFileMode(logPath);
+
+            storage.Compact(3);
+
+            await Assert.That(calls).IsEqualTo(2);
+            await Assert.That(PosixAcl.Get(logPath, PosixAcl.AccessName)!.AsSpan().SequenceEqual(expectedAcl)).IsTrue();
+            await Assert.That(System.IO.File.GetUnixFileMode(logPath)).IsEqualTo(expectedMode);
+            await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    public async Task Compact_OnLinux_WithholdsTheAccessOfAGroupItCannotAssign()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            // The log's group is read from the injected statx result on Linux.
+            return;
+        }
+
+        const uint unassignableGid = 4545;
+        var statx = new LogGroupStatx(unassignableGid);
+        string directory = CreateDirectory();
+        try
+        {
+            string logPath = Path.Combine(directory, "log");
+            using var storage = new FileRaftStorage(
+                new FileRaftStorageOptions(directory) { Fsync = false },
+                _ => { },
+                statx.Call);
+            storage.Append(CreateEntries(1, 5));
+            System.IO.File.SetUnixFileMode(
+                logPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead
+                | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+
+            storage.Compact(3);
+
+            UnixFileMode actual = System.IO.File.GetUnixFileMode(logPath);
+            using (var log = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                if (UnixStagedLog.ReadStatus(log.SafeFileHandle, logPath, statx: null).Gid == unassignableGid)
+                {
+                    // Running as root, the compacted log has the log's group and its whole access.
+                    await Assert.That(actual).IsEqualTo(
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead
+                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                }
+                else
+                {
+                    // The group gets nothing, and the log's group members, now in the other class, keep only read.
+                    await Assert.That(actual).IsEqualTo(
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.OtherRead);
+                }
+            }
+
+            await Assert.That(storage.FirstIndex()).IsEqualTo(4UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
+    [Arguments(0b110_100_110u, 0b110_000_100u)]
+    [Arguments(0b110_000_110u, 0b110_000_000u)]
+    [Arguments(0b111_111_111u, 0b111_000_111u)]
+    public async Task WithholdLogGroupAccess_WithoutAcl_LimitsOthersToTheGroupAccess(uint mode, uint expected)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Unix permission bits only.
+            return;
+        }
+
+        await Assert.That(UnixStagedLog.WithholdLogGroupAccess(null, mode, "log.compact")).IsEqualTo(expected);
+    }
+
+    [Test]
+    public async Task WithholdLogGroupAccess_WithAcl_LimitsOthersToTheGroupEntryAndKeepsTheMask()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            // POSIX access control lists are copied on Linux only.
+            return;
+        }
+
+        byte[] acl = PosixAcl.Create(
+            (PosixAcl.UserObject, 6, PosixAcl.NoId),
+            (PosixAcl.User, 4, LogAclUid),
+            (PosixAcl.GroupObject, 4, PosixAcl.NoId),
+            (PosixAcl.Mask, 6, PosixAcl.NoId),
+            (PosixAcl.Other, 6, PosixAcl.NoId));
+        byte[] expected = PosixAcl.Create(
+            (PosixAcl.UserObject, 6, PosixAcl.NoId),
+            (PosixAcl.User, 4, LogAclUid),
+            (PosixAcl.GroupObject, 0, PosixAcl.NoId),
+            (PosixAcl.Mask, 6, PosixAcl.NoId),
+            (PosixAcl.Other, 4, PosixAcl.NoId));
+
+        uint mode = UnixStagedLog.WithholdLogGroupAccess(acl, 0b110_110_110u, "log.compact");
+
+        await Assert.That(mode).IsEqualTo(0b110_110_100u);
+        await Assert.That(acl.AsSpan().SequenceEqual(expected)).IsTrue();
+    }
+
+    [Test]
     public async Task Compact_OnUnix_DoesNotWriteThroughALinkAtTheStagingPath()
     {
         if (OperatingSystem.IsWindows())
@@ -989,6 +1179,20 @@ public sealed class FileRaftStorageTests
         return directory;
     }
 
+    private static StatxCall FailingStatx(StatxFailure failure, Action onCall)
+    {
+        return (_, _) =>
+        {
+            onCall();
+            return failure switch
+            {
+                StatxFailure.MissingSymbol => throw new EntryPointNotFoundException("statx"),
+                StatxFailure.NotImplemented => StatxNotImplemented,
+                _ => 1,
+            };
+        };
+    }
+
     [SupportedOSPlatform("linux")]
     private static string CreateDirectoryWithDefaultAcl()
     {
@@ -1015,6 +1219,31 @@ public sealed class FileRaftStorageTests
         if (Directory.Exists(directory))
         {
             Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Answers statx from the runtime's file status, whichever libc the test runs on, and reports a group for the log,
+    /// the first file read, that the process is not a member of.
+    /// </summary>
+    [SupportedOSPlatform("linux")]
+    private sealed class LogGroupStatx(uint gid)
+    {
+        private const uint ModeUidGid = 0x2 | 0x8 | 0x10;
+        private const int UidOffset = 20;
+        private const int GidOffset = 24;
+        private const int ModeOffset = 28;
+        private int _calls;
+
+        public int Call(int descriptor, Span<byte> buffer)
+        {
+            using var file = new SafeFileHandle((IntPtr)descriptor, ownsHandle: false);
+            UnixFileStatus status = UnixStagedLog.ReadStatus(file, "log", static (_, _) => StatxNotImplemented);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer, ModeUidGid);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(UidOffset), status.Uid);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(GidOffset), _calls++ == 0 ? gid : status.Gid);
+            BinaryPrimitives.WriteUInt16LittleEndian(buffer.Slice(ModeOffset), (ushort)status.Mode);
+            return 0;
         }
     }
 

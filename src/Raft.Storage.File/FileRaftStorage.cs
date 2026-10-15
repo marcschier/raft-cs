@@ -35,6 +35,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private readonly string _snapshotPath;
     private readonly bool _fsync;
     private readonly Action<string> _syncDirectory;
+    private readonly StatxCall? _statx;
     private readonly List<Entry> _entries = new() { default };
     private FileStream _logStream;
     private HardState _hardState;
@@ -51,7 +52,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     {
     }
 
-    internal FileRaftStorage(FileRaftStorageOptions options, Action<string> syncDirectory)
+    internal FileRaftStorage(FileRaftStorageOptions options, Action<string> syncDirectory, StatxCall? statx = null)
     {
         ThrowIfNull(options);
         ThrowIfNull(syncDirectory);
@@ -59,6 +60,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         Directory.CreateDirectory(options.DirectoryPath);
         _fsync = options.Fsync;
         _syncDirectory = syncDirectory;
+        _statx = statx;
         _logPath = Path.Combine(options.DirectoryPath, LogFileName);
         _compactingLogPath = Path.Combine(options.DirectoryPath, CompactingLogFileName);
         _hardStatePath = Path.Combine(options.DirectoryPath, HardStateFileName);
@@ -769,7 +771,11 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 // Every payload is written while the compacted log is owner-only; only then does it get the log's
                 // access, before the sync and the replacement publish it.
                 compacted.Flush();
-                UnixStagedLog.ApplyLogAccess(_logStream.SafeFileHandle, compacted.SafeFileHandle, _compactingLogPath);
+                UnixStagedLog.ApplyLogAccess(
+                    _logStream.SafeFileHandle,
+                    compacted.SafeFileHandle,
+                    _compactingLogPath,
+                    _statx);
             }
 
             compacted.Flush(_fsync);
