@@ -97,6 +97,38 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task CreateSnapshot_PastTheLastIndex_IsRefusedWithoutWrappingTheIndex()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            var confState = new Configuration.ConfState(TwoVoters);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                storage.Append(CreateEntries(1, 1));
+
+                // 2^32 + 1 would wrap to entry 1 in a narrowing index cast.
+                await AssertStorageError(
+                    () => storage.CreateSnapshot((1UL << 32) + 1, confState, new byte[] { 1 }),
+                    RaftStorageError.Unavailable);
+                await AssertStorageError(
+                    () => storage.CreateSnapshot(2, confState, new byte[] { 1 }),
+                    RaftStorageError.Unavailable);
+                await Assert.That(storage.LatestSnapshot()).IsNull();
+            }
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.LatestSnapshot()).IsNull();
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(1UL);
+            await Assert.That(reopened.LastIndex()).IsEqualTo(1UL);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task CreateSnapshot_KeepsTheEntriesAfterIt_AndSurvivesReopen()
     {
         string directory = CreateDirectory();

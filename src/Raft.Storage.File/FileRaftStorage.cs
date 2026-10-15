@@ -1122,6 +1122,12 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             throw new RaftStorageException(RaftStorageError.Compacted);
         }
 
+        // Checked before the narrowing cast below, which would wrap for an index far past the log.
+        if (index > LastIndexLocked())
+        {
+            throw new RaftStorageException(RaftStorageError.Unavailable);
+        }
+
         int i = (int)(index - offset);
         if (i >= _entries.Count)
         {

@@ -111,11 +111,11 @@ await foreach (CommittedItem item in node.CommittedItems.ReadAllAsync(ct))
     if (item.Kind == CommittedItemKind.Snapshot)
     {
         RestoreMyState(item.Data.Span);   // replaces the whole state
+        sinceSnapshot = 0;                // already stored at this index; do not record it again
+        continue;
     }
-    else
-    {
-        ApplyToMyState(item.Data.Span);
-    }
+
+    ApplyToMyState(item.Data.Span);
 
     if (++sinceSnapshot >= 1024)
     {
