@@ -773,7 +773,8 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 
     /// <summary>
     /// Replaces the log file with one that holds only the retained log: the compaction boundary, the entries after it,
-    /// and the hard state.
+    /// and the hard state. Any other state the log records, and any record a log must start with, is carried into the
+    /// compacted log as well; the guard record for older readers directly follows the compaction boundary.
     /// </summary>
     /// <returns>Whether the log file was replaced; not when its access cannot be reproduced on a new file.</returns>
     private bool TryRewriteLog(List<Entry> compactedEntries)
