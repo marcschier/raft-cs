@@ -1135,6 +1135,46 @@ public sealed class FileRaftStorageTests
     }
 
     [Test]
+    public async Task ApplySnapshot_OverALegacyLog_FencesItBeforePublishingTheSnapshot()
+    {
+        string directory = CreateDirectory();
+        string logPath = Path.Combine(directory, "log");
+        string newLogPath = Path.Combine(directory, "log.new");
+        try
+        {
+            new LegacyStoreFormat.Log()
+                .Append(CreateEntries(1, 5))
+                .HardState(new HardState(5, 1, 5))
+                .WriteTo(directory);
+            using (var storage = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false }))
+            {
+                // The process stops after the snapshot is published, before the log that replaces the superseded one
+                // is written: here the replacement cannot be created.
+                Directory.CreateDirectory(newLogPath);
+                var installed = new Snapshot(
+                    new SnapshotMetadata(8, 8, new Configuration.ConfState(TwoVoters)), new byte[] { 8 });
+                await Assert.That(Capture(() => storage.ApplySnapshot(installed))).IsNotNull();
+            }
+
+            Directory.Delete(newLogPath);
+
+            // An earlier reader, which ignores the generation the published snapshot names, fails on the fence instead
+            // of replaying the superseded entries after the snapshot.
+            await Assert.That(string.Join(",", LogRecordKinds(logPath))).IsEqualTo("1,0,0,0,0,0,3,fence");
+
+            using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
+            await Assert.That(reopened.LatestSnapshot()!.Metadata.Index).IsEqualTo(8UL);
+            await Assert.That(reopened.FirstIndex()).IsEqualTo(9UL);
+            await Assert.That(reopened.InitialState().HardState).IsEqualTo(new HardState(8, 1, 8));
+            await Assert.That(string.Join(",", LogRecordKinds(logPath))).IsEqualTo("6,fence,5,7,3");
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Test]
     public async Task Reopen_RefusesALogRewrittenByACompactionItDoesNotRead()
     {
         string directory = CreateDirectory();
