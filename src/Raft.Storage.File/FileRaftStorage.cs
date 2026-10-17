@@ -18,13 +18,19 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
     private const byte TruncateRecord = 1;
     private const byte CompactRecord = 2;
     private const byte HardStateRecord = 3;
-    private const byte ConfStateRecord = 4;
+
+    // Starts a log rewritten by compaction with its retained entries renumbered, which this version does not read.
+    private const byte CompactionBaseRecord = 4;
     private const byte ConfStateIndexRecord = 5;
     private const byte LogGenerationRecord = 6;
+    private const byte ConfStateRecord = 7;
     private const int LengthPrefixSize = 4;
     private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
     private const int HardStateRecordSize = 1 + (3 * 8);
     private const int UInt64Size = 8;
+
+    // A compaction index no log reaches. Earlier readers fail on a compaction record with it; this store skips it.
+    private const ulong RollbackFenceIndex = ulong.MaxValue;
 
     // Ends a snapshot file whose membership is the one at the snapshot's index. Earlier versions wrote no marker and
     // rewrote the snapshot file with the latest membership on every SetConfState, keeping the snapshot's index.
@@ -61,6 +67,9 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
 
     // The generation of the log that continues the snapshot, or null when the snapshot file records none.
     private ulong? _snapshotGeneration;
+
+    // Whether the log holds a rollback fence, which precedes its first configuration record.
+    private bool _logHasRollbackFence;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -371,7 +380,8 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
 
     /// <summary>
     /// Writes a log of <paramref name="generation"/> beside the current one and swaps it in, so after a crash either
-    /// the former or the new log is in place.
+    /// the former or the new log is in place. A log written whole starts with its generation record, which is read
+    /// before the log is replayed, and holds the membership after a rollback fence; any rewrite of the log keeps both.
     /// </summary>
     private void ReplaceLog(ulong generation, ulong confStateIndex)
     {
@@ -382,6 +392,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             try
             {
                 WriteLogGenerationRecord(generation);
+                WriteRollbackFence();
                 WriteConfStateRecords(_confState, confStateIndex);
                 WriteHardStateRecord(_hardState);
                 FlushLog();
@@ -403,6 +414,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         }
 
         _logGeneration = generation;
+        _logHasRollbackFence = true;
     }
 
     private FileStream OpenLog()
@@ -430,15 +442,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             if (!_snapshot.MembershipIsAtIndex)
             {
                 // The current membership is stored only in the snapshot file this one replaces; keep it in the log.
-                if (_confStateIndex is { } confStateIndex)
-                {
-                    WriteConfStateRecords(_confState, confStateIndex);
-                }
-                else
-                {
-                    WriteConfStateRecord(_confState);
-                }
-
+                AppendConfStateRecords(_confState, _confStateIndex);
                 FlushLog();
             }
 
@@ -506,7 +510,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             ThrowIfDisposed();
             _confState = confState;
             _confStateIndex = null;
-            WriteConfStateRecord(confState);
+            AppendConfStateRecords(confState, index: null);
             FlushLog();
         }
     }
@@ -521,7 +525,7 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
             ThrowIfDisposed();
             _confState = confState;
             _confStateIndex = index;
-            WriteConfStateRecords(confState, index);
+            AppendConfStateRecords(confState, index);
             FlushLog();
         }
     }
@@ -845,6 +849,11 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
                 {
                     int offset = 1;
                     ulong compactIndex = ReadUInt64(payload, ref offset);
+                    if (compactIndex == RollbackFenceIndex)
+                    {
+                        _logHasRollbackFence = true;
+                        break;
+                    }
 
                     // A snapshot recorded after this compaction already covers it.
                     if (compactIndex > _entries[0].Index)
@@ -878,6 +887,9 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
                 }
 
                 break;
+            case CompactionBaseRecord:
+                throw new InvalidDataException(
+                    $"The log file '{_logPath}' was rewritten by a compaction that this version does not read.");
             case ConfStateIndexRecord:
                 if (payload.Length == 1 + UInt64Size)
                 {
@@ -939,23 +951,41 @@ public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexS
         WriteRecord(payload);
     }
 
-    /// <summary>
-    /// Writes the index record, then the configuration record it belongs to. A configuration record without an index
-    /// record right before it has an unknown index; an index record without its configuration record is dropped on
-    /// open.
-    /// </summary>
-    private void WriteConfStateRecords(ConfState confState, ulong index)
+    private void WriteRollbackFence()
     {
-        Span<byte> indexPayload = stackalloc byte[1 + UInt64Size];
-        indexPayload[0] = ConfStateIndexRecord;
-        int indexOffset = 1;
-        WriteUInt64(indexPayload, ref indexOffset, index);
-        WriteRecord(indexPayload);
-        WriteConfStateRecord(confState);
+        // Readers before this format ignore the configuration records that follow; they fail on this compaction
+        // record instead of opening the store with an earlier membership.
+        WriteCompactRecord(RollbackFenceIndex);
     }
 
-    private void WriteConfStateRecord(ConfState confState)
+    /// <summary>Appends configuration records to the log, after a rollback fence when the log holds none yet.</summary>
+    private void AppendConfStateRecords(ConfState confState, ulong? index)
     {
+        if (!_logHasRollbackFence)
+        {
+            WriteRollbackFence();
+            _logHasRollbackFence = true;
+        }
+
+        WriteConfStateRecords(confState, index);
+    }
+
+    /// <summary>
+    /// Writes the index record, when the index is known, then the configuration record it belongs to. A configuration
+    /// record without an index record right before it has an unknown index; an index record without its configuration
+    /// record is dropped on open.
+    /// </summary>
+    private void WriteConfStateRecords(ConfState confState, ulong? index)
+    {
+        if (index is { } knownIndex)
+        {
+            Span<byte> indexPayload = stackalloc byte[1 + UInt64Size];
+            indexPayload[0] = ConfStateIndexRecord;
+            int indexOffset = 1;
+            WriteUInt64(indexPayload, ref indexOffset, knownIndex);
+            WriteRecord(indexPayload);
+        }
+
         byte[] payload = new byte[1 + ConfStateLength(confState)];
         payload[0] = ConfStateRecord;
         int offset = 1;
