@@ -314,16 +314,16 @@ public sealed class RaftNodeSnapshotDeliveryTests
         await using var network = new InMemoryNetwork();
 
         // Read through the item reader: it takes the snapshot, then a command.
-        RaftNode node = CreateSingleNode(network, CreateSnapshotAndTwoCommands());
+        RaftNode node = CreateSingleNode(network, createSnapshotAndTwoCommands());
         try
         {
-            await AssertCounts(node, commands: 2, items: 3);
+            await assertCounts(node, commands: 2, items: 3);
             await Assert.That((await node.CommittedItems.ReadAsync()).Kind).IsEqualTo(CommittedItemKind.Snapshot);
-            await AssertCounts(node, commands: 2, items: 2);
+            await assertCounts(node, commands: 2, items: 2);
             await node.Committed.ReadAsync();
-            await AssertCounts(node, commands: 1, items: 1);
+            await assertCounts(node, commands: 1, items: 1);
             await node.CommittedItems.ReadAsync();
-            await AssertCounts(node, commands: 0, items: 0);
+            await assertCounts(node, commands: 0, items: 0);
         }
         finally
         {
@@ -332,19 +332,19 @@ public sealed class RaftNodeSnapshotDeliveryTests
 
         // Read through the payload reader: it skips the snapshot and takes the first command.
         await using var otherNetwork = new InMemoryNetwork();
-        node = CreateSingleNode(otherNetwork, CreateSnapshotAndTwoCommands());
+        node = CreateSingleNode(otherNetwork, createSnapshotAndTwoCommands());
         try
         {
             ReadOnlyMemory<byte> first = await node.Committed.ReadAsync();
             await Assert.That(first.ToArray().SequenceEqual(new byte[] { 2 })).IsTrue();
-            await AssertCounts(node, commands: 1, items: 1);
+            await assertCounts(node, commands: 1, items: 1);
         }
         finally
         {
             await node.DisposeAsync();
         }
 
-        static MemoryStorage CreateSnapshotAndTwoCommands()
+        static MemoryStorage createSnapshotAndTwoCommands()
         {
             var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
             storage.Append(new[]
@@ -358,7 +358,7 @@ public sealed class RaftNodeSnapshotDeliveryTests
             return storage;
         }
 
-        static async Task AssertCounts(RaftNode node, int commands, int items)
+        static async Task assertCounts(RaftNode node, int commands, int items)
         {
             await Assert.That(node.Committed.Count).IsEqualTo(commands);
             await Assert.That(node.CommittedItems.Count).IsEqualTo(items);

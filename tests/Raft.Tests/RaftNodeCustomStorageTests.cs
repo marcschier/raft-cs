@@ -178,6 +178,13 @@ public sealed class RaftNodeCustomStorageTests
         try
         {
             await StartLeaderAsync(node, timeout.Token);
+
+            // The request below names the applied index, which must be at least 1: the leader's empty entry.
+            while (node.AppliedIndex == 0)
+            {
+                await Task.Delay(10, timeout.Token);
+            }
+
             storage.FailWrites();
             Task proposal = node.ProposeAsync(Encoding.UTF8.GetBytes("x"), timeout.Token).AsTask();
 
@@ -363,7 +370,8 @@ public sealed class RaftNodeCustomStorageTests
 
         public (HardState HardState, ConfState ConfState) InitialState() => Inner.InitialState();
 
-        public IReadOnlyList<Entry> Entries(ulong low, ulong high, ulong maxBytes) => Inner.Entries(low, high, maxBytes);
+        public IReadOnlyList<Entry> Entries(ulong low, ulong high, ulong maxBytes) =>
+            Inner.Entries(low, high, maxBytes);
 
         public ulong Term(ulong index) => Inner.Term(index);
 
