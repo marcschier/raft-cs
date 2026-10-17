@@ -10,50 +10,59 @@ A `RaftNode` is one replica. It owns a deterministic consensus core, a durable `
 
 A state machine is just a fold over the committed command stream. Three rules make it correct across restarts:
 
-1. **Apply in order, from `Committed`.** Never apply a command before it appears on `Committed`.
+1. **Apply in order, from `CommittedItems`** (or `Committed`). Never apply a command before it appears there.
 2. **Track the applied index durably**, alongside your state. On restart you must not re-apply commands you already applied (the log replays from the last snapshot/compaction point, which may be behind your state machine).
 3. **Make apply idempotent or index-guarded**, because after a crash you may see a command you already applied.
 
-`RaftNode` does not tag each committed payload with its log index (the `Committed` stream is raw bytes). The simplest robust pattern is to make the **index part of your command** (or derive your applied index from your own state) so you can skip already-applied commands:
+`CommittedItems` delivers each committed command with its log index (`CommittedItem.Index`) and term, so the index of the last item you applied is the log position your state corresponds to. It also delivers snapshots (`CommittedItemKind.Snapshot`) that replace your state; see [Snapshots and log compaction](#snapshots-and-log-compaction). Guard with the index to skip already-applied items:
 
 ```csharp
-long applied = LoadAppliedIndexFromMyStore(); // durable, next to your state
+ulong applied = LoadAppliedIndexFromMyStore(); // durable, next to your state
 
-await foreach (ReadOnlyMemory<byte> payload in node.Committed.ReadAllAsync(ct))
+await foreach (CommittedItem item in node.CommittedItems.ReadAllAsync(ct))
 {
-    Command command = Decode(payload.Span);
-    if (command.Index <= applied)
+    if (item.Index <= applied)
     {
         continue; // already applied before the crash
     }
 
-    ApplyToMyState(command);          // mutate your state machine
-    applied = command.Index;
+    if (item.Kind == CommittedItemKind.Snapshot)
+    {
+        RestoreMyState(item.Data.Span);   // replaces the whole state
+    }
+    else
+    {
+        ApplyToMyState(item.Data.Span);   // mutate your state machine
+    }
+
+    applied = item.Index;
     PersistMyStateAndAppliedIndex();  // durably, together
 }
 ```
 
-If you do not want to stamp indices into commands, you can instead consume `Committed` and persist your applied state and a monotonically increasing counter together, treating the counter as your applied watermark.
+`Committed` is the same stream without the positions (only the payloads); both read one queue, so consume one of them.
 
-The node's own watermarks are available for coordination: `node.CommitIndex` (committed) and `node.AppliedIndex` (the highest index the node has surfaced through `Committed`).
+The node's own watermarks are available for coordination: `node.CommitIndex` (committed) and `node.AppliedIndex` (the highest index the node has applied and queued on `CommittedItems`, which your consumer may not have processed yet).
 
 ## Bootstrapping and restarting
 
 Every voter needs the **same initial membership**, given as a `ConfState` of node ids.
 
 - **`MemoryStorage`** takes the membership in its constructor: `new MemoryStorage(new ConfState(new ulong[] {1,2,3}))`.
-- **`FileRaftStorage`** has no `ConfState` constructor. For a *fresh* cluster, seed it once (see below); on *restart* it recovers membership, log, and hard state from disk — do not re-seed.
+- **`FileRaftStorage`** has no `ConfState` constructor. For a *fresh* cluster, seed it once with `SetConfState(initial, 0)` (see below); on *restart* it recovers membership, log, and hard state from disk — do not re-seed.
 
 ```csharp
 using var storage = new FileRaftStorage(new FileRaftStorageOptions("/var/lib/raft/node1"));
 if (storage.InitialState().ConfState.Voters.Count == 0)
 {
-    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 }));
+    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 }), 0); // bootstrap once, at index 0
 }
 
 await using var node = new RaftNode(config, storage, transport);
 await node.StartAsync();
 ```
+
+Index 0 (the `IRaftConfStateIndexStorage` overload) records that the membership precedes every log entry, so a node that crashes after a membership change commits, but before the new membership is recorded, applies the change on restart. The one-argument `SetConfState(confState)` is the compatible form: it leaves the index unknown, and a restarting node then keeps the stored membership as it is. Without a recorded index, a restart can also apply configuration changes committed after the stored commit index again although the stored membership already reflects them, as earlier versions did. Both built-in stores record the index once a configuration change is applied, and bootstrapping with `SetConfState(initial, 0)` records it from the start, which closes this window.
 
 Add or remove members at runtime with `ChangeConfigurationAsync` (single or joint changes, including learners). Watch `CommittedConfigurations` to learn when a change commits.
 
@@ -87,21 +96,37 @@ Set `BindAddress` to `tcp://*:0` for an OS-assigned port and read it back from `
 
 Without compaction the log grows forever. Compaction discards the already-applied prefix; a follower that then falls behind the compacted boundary is caught up by an **install-snapshot** message instead of a log replay.
 
-**What the library does:** `RaftNode.CompactAsync(index)` discards the applied prefix on the driver loop (thread-safe), and the leader automatically sends a snapshot (produced by `IRaftStorage.Snapshot()`) to any follower whose next index falls below the compacted boundary. A follower installs that snapshot via `IRaftWritableStorage.ApplySnapshot`.
+The snapshot carries your *application* state, which only your code knows, so your state machine creates it and the node does the rest:
 
-**What you must provide:** the snapshot must carry your *application* state, and only your code knows that state. The built-in `MemoryStorage` and `FileRaftStorage` are **log stores** — their `Snapshot()` returns no application data, so they cannot bring a far-behind follower's state machine up to date. For production compaction you have two options:
+- **Create.** `RaftNode.CreateSnapshotAsync(index, data)` records your serialized state at `index` (the `CommittedItem.Index` of the last item you applied) in the storage, with the cluster membership at that index. The storage must implement `IRaftSnapshotStorage`; `MemoryStorage` and `FileRaftStorage` do.
+- **Compact.** `RaftNode.CompactAsync(index)` then discards the log up to `index` on the driver loop. It refuses to compact past the latest snapshot, because the snapshot and the log after it must together hold every applied command. `FileRaftStorage` drops the compacted entries from memory and appends a compaction record to its log file; in this version compaction does not shrink the file.
+- **Lagging followers.** The leader sends the latest snapshot to any follower whose next index falls below the compacted boundary. Once the follower has stored it, its `CommittedItems` stream delivers it as a `CommittedItemKind.Snapshot` item: replace your state with `item.Data`, then apply the commands after it. A snapshot `FileRaftStorage` kept from an earlier version is restored on restart but never sent, because it does not record the membership at its index; until your application records a new snapshot with `CreateSnapshotAsync`, a follower behind it waits. In the other direction, once this version has stored a membership in a `FileRaftStorage`, also by installing a snapshot, earlier versions refuse to open the store rather than read an earlier membership.
+- **Restart.** When the storage holds a snapshot, `CommittedItems` starts with it, followed by the commands after it. A storage whose log was compacted past its latest snapshot is refused (`InvalidOperationException`), because the commands in between are lost.
 
-1. **Keep voters caught up before compacting** (e.g. compact only well behind the slowest follower's match index) so no follower ever needs a data-carrying snapshot. Simplest, works with the built-in stores.
-2. **Implement a snapshotting `IRaftStorage`** whose `Snapshot()` serializes your state machine and whose `ApplySnapshot()` restores it (the raft-rs/etcd model, where storage and state machine are integrated). This is the robust path for clusters where a follower can fall arbitrarily behind.
-
-A safe compaction loop:
+A compaction loop inside your state machine's apply loop:
 
 ```csharp
-// Periodically, after persisting your state machine up to node.AppliedIndex:
-await node.CompactAsync(node.AppliedIndex);
+await foreach (CommittedItem item in node.CommittedItems.ReadAllAsync(ct))
+{
+    if (item.Kind == CommittedItemKind.Snapshot)
+    {
+        RestoreMyState(item.Data.Span);   // replaces the whole state
+        sinceSnapshot = 0;                // already stored at this index; do not record it again
+        continue;
+    }
+
+    ApplyToMyState(item.Data.Span);
+
+    if (++sinceSnapshot >= 1024)
+    {
+        await node.CreateSnapshotAsync(item.Index, SerializeMyState(), ct);
+        await node.CompactAsync(item.Index, ct);
+        sinceSnapshot = 0;
+    }
+}
 ```
 
-> Application-facing delivery of snapshot *data* through the node (so even a generic log store could hand a follower's state machine the bytes) is a planned enhancement; today it requires a snapshotting `IRaftStorage` as in option 2.
+With snapshots in the storage, the snapshot is the durable copy of your state, so you need not persist the state and applied index yourself: after a restart the node hands you the snapshot and replays the commands after it. `Committed` (payloads only) skips snapshot items; use `CommittedItems` when you compact.
 
 ## Operations
 

@@ -12,8 +12,10 @@ The shipping surface is the async `RaftNode` facade plus the deterministic `Raft
 | `ValueTask ChangeConfigurationAsync(ConfChangeV2, CancellationToken)` | Proposes a membership change. |
 | `ValueTask TransferLeadershipAsync(ulong targetId, CancellationToken)` | Requests leadership transfer (leader only). |
 | `ValueTask CampaignAsync(CancellationToken)` | Forces an immediate election campaign. |
-| `Task CompactAsync(ulong index, CancellationToken)` | Discards the applied log prefix before `index` (on the loop; thread-safe). |
-| `ChannelReader<ReadOnlyMemory<byte>> Committed` | Committed application commands, in log order. |
+| `Task<SnapshotMetadata> CreateSnapshotAsync(ulong index, ReadOnlyMemory<byte> data, CancellationToken)` | Records a snapshot of the application state at `index` (on the loop; requires an `IRaftSnapshotStorage`). |
+| `Task CompactAsync(ulong index, CancellationToken)` | Discards the applied log prefix before `index` (on the loop; thread-safe); never past the latest snapshot. |
+| `ChannelReader<ReadOnlyMemory<byte>> Committed` | Committed application commands, in log order (the command payloads of `CommittedItems`, without snapshots). |
+| `ChannelReader<CommittedItem> CommittedItems` | The apply stream, in log order: commands (`CommittedItemKind.Command`) and snapshots that replace the application state (`CommittedItemKind.Snapshot`, after a restart and when a leader's snapshot is installed), each with its log `Index` and `Term`. Reads the same queue as `Committed`; consume one of them. |
 | `ChannelReader<RaftStateChange> StateChanges` | Leadership/role transitions (baseline first, then on leader-id/role change). |
 | `ChannelReader<ConfState> CommittedConfigurations` | Committed cluster configurations (baseline first, then on each membership change). |
 | `ConfState Configuration` | The most recently committed cluster configuration. |
@@ -58,6 +60,8 @@ Apply committed conf-change entries by computing the new `ConfState` (via `Chang
 | --- | --- |
 | `IRaftStorage` | Read side: `InitialState`, `Entries`, `Term`, `FirstIndex`, `LastIndex`, `Snapshot`. |
 | `IRaftWritableStorage` | Adds `Append`, `ApplySnapshot`, `Compact`, `SetHardState`, `SetConfState`. |
+| `IRaftSnapshotStorage` | Adds `CreateSnapshot` (application state at an index, keeping the log after it) and `LatestSnapshot`. Implemented by both built-in stores. |
+| `IRaftConfStateIndexStorage` | Optional. Adds `SetConfState(confState, index)`, which stores the committed membership with the index of the last configuration change it reflects (zero for the bootstrap membership), and `ConfStateIndex()`, which returns that index, or `null` when it is unknown (membership stored with the one-argument `SetConfState`). A restarting `RaftNode` replays the committed configuration changes after that index, or starts from the membership of a snapshot it restores at or after that index; over any other store, or when the index is unknown, it keeps the stored membership, also over a snapshot's, and replays none. Without a recorded index, a restart can apply configuration changes committed after the stored commit index again although the stored membership already reflects them (the behaviour of earlier versions). Implemented by both built-in stores, which record the index once a configuration change is applied; `new MemoryStorage(confState)` records its membership at index 0, and bootstrapping a `FileRaftStorage` with `SetConfState(initial, 0)` does the same, which closes that window. |
 | `MemoryStorage` | Volatile in-memory store (package `RaftCs`). |
 | `FileRaftStorage` / `FileRaftStorageOptions` | Crash-safe file (WAL) store (package `RaftCs.Storage.File`). |
 

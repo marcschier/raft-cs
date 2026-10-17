@@ -22,7 +22,7 @@ Raft lets a cluster of nodes agree on an ordered log of commands and survive the
 | Asynchronous storage writes (leader replicates while persisting to its own disk) | ✅ |
 | Internal proposal forwarding; uncommitted-log cap | ✅ |
 | Persistent storage (`IRaftStorage`: in-memory + file/WAL) | ✅ |
-| Snapshot install + log compaction (`CompactAsync`; app-state snapshots need a custom store) | ✅ |
+| Application snapshots, snapshot install to lagging followers, restore on restart, log compaction (`CreateSnapshotAsync`, `CompactAsync`) | ✅ |
 | Single-node + **joint-consensus** membership changes, learners | ✅ |
 | Leadership transfer | ✅ |
 | Push observation of leadership/role and committed membership | ✅ |
