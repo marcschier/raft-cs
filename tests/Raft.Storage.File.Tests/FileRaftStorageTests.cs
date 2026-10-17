@@ -126,7 +126,8 @@ public sealed class FileRaftStorageTests
                 storage.Append(CreateEntries(21, 1, payloadLength: 16));
             }
 
-            await Assert.That(System.IO.File.ReadAllBytes(Path.Combine(second, "store", "log"))).IsEquivalentTo(otherLog);
+            await Assert.That(System.IO.File.ReadAllBytes(Path.Combine(second, "store", "log")))
+                .IsEquivalentTo(otherLog);
             using var reopened = new FileRaftStorage(new FileRaftStorageOptions(Path.Combine(first, "store")));
             await Assert.That(reopened.FirstIndex()).IsEqualTo(11UL);
             await Assert.That(reopened.LastIndex()).IsEqualTo(21UL);
@@ -530,10 +531,11 @@ public sealed class FileRaftStorageTests
                 new FileInfo(logPath).SetAccessControl(restricted);
             }
 
-            string expected = AccessRules(logPath);
+            string expected = accessRules(logPath);
             await Assert.That(expected.StartsWith("protected=True;", StringComparison.Ordinal)).IsEqualTo(restrictLog);
 
-            // A leftover compacted log with the directory's inherited rules must not be reused for the retained payloads.
+            // A leftover compacted log with the directory's inherited rules must not be reused for the retained
+            // payloads.
             System.IO.File.WriteAllBytes(compactingPath, Array.Empty<byte>());
 
             using var reopened = new FileRaftStorage(new FileRaftStorageOptions(directory) { Fsync = false });
@@ -544,11 +546,11 @@ public sealed class FileRaftStorageTests
                 await Assert.That(Capture(() => reopened.Compact(3)) is not null).IsTrue();
             }
 
-            await Assert.That(AccessRules(compactingPath)).IsEqualTo(expected);
+            await Assert.That(accessRules(compactingPath)).IsEqualTo(expected);
 
             reopened.Compact(3);
 
-            await Assert.That(AccessRules(logPath)).IsEqualTo(expected);
+            await Assert.That(accessRules(logPath)).IsEqualTo(expected);
             await Assert.That(System.IO.File.Exists(compactingPath)).IsFalse();
             await Assert.That(reopened.FirstIndex()).IsEqualTo(4UL);
             await AssertEntriesEqual(reopened.Entries(4, 7, ulong.MaxValue), CreateEntries(4, 3));
@@ -559,7 +561,7 @@ public sealed class FileRaftStorageTests
         }
 
         [SupportedOSPlatform("windows")]
-        static string AccessRules(string path)
+        static string accessRules(string path)
         {
             FileSecurity security = new FileInfo(path).GetAccessControl();
 
