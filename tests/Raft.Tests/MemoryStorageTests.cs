@@ -81,6 +81,36 @@ public sealed class MemoryStorageTests
         (HardState hardState, ConfState restored) = storage.InitialState();
         await Assert.That(hardState.Commit).IsEqualTo((ulong)5);
         await Assert.That(string.Join(",", restored.Voters)).IsEqualTo("1,2,3");
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)5);
+    }
+
+    [Test]
+    public async Task SetConfState_RecordsTheIndexItReflects()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)0);
+
+        var confState = new ConfState(new ulong[] { 1, 2 });
+        storage.SetConfState(confState, 4);
+
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)4);
+        await Assert.That(storage.InitialState().ConfState.Equals(confState)).IsTrue();
+    }
+
+    [Test]
+    public async Task SetConfState_WithoutIndex_LeavesTheIndexUnknown()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        storage.SetConfState(new ConfState(new ulong[] { 1, 2 }), 4);
+
+        var confState = new ConfState(new ulong[] { 1, 2, 3 });
+        storage.SetConfState(confState);
+
+        await Assert.That(storage.ConfStateIndex()).IsNull();
+        await Assert.That(storage.InitialState().ConfState.Equals(confState)).IsTrue();
+
+        storage.SetConfState(confState, 7);
+        await Assert.That(storage.ConfStateIndex()).IsEqualTo((ulong?)7);
     }
 
     [Test]
@@ -158,5 +188,77 @@ public sealed class MemoryStorageTests
         await Assert.That(snapshot.Metadata.Index).IsEqualTo((ulong)2);
         await Assert.That(snapshot.Metadata.Term).IsEqualTo((ulong)2);
         await Assert.That(string.Join(",", snapshot.Metadata.ConfState.Voters)).IsEqualTo("1,2");
+    }
+
+    [Test]
+    public async Task CreateSnapshot_KeepsTheLogAndIsWhatTheLeaderSends()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        storage.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.Normal, 2, 2, default),
+            new Entry(EntryType.Normal, 2, 3, default),
+        });
+        storage.SetHardState(new HardState(2, 0, 3));
+        byte[] state = { 7, 7 };
+
+        Snapshot created = storage.CreateSnapshot(2, new ConfState(new ulong[] { 1 }), state);
+        state[0] = 0;
+
+        await Assert.That(created.Metadata.Index).IsEqualTo((ulong)2);
+        await Assert.That(created.Metadata.Term).IsEqualTo((ulong)2);
+        await Assert.That(storage.LatestSnapshot()).IsSameReferenceAs(created);
+        await Assert.That(storage.Snapshot(0)).IsSameReferenceAs(created);
+        await Assert.That(created.Data.ToArray().SequenceEqual(new byte[] { 7, 7 })).IsTrue();
+        await Assert.That(storage.FirstIndex()).IsEqualTo((ulong)1);
+        await Assert.That(storage.LastIndex()).IsEqualTo((ulong)3);
+        await Assert.That(() => storage.CreateSnapshot(2, new ConfState(new ulong[] { 1 }), state))
+            .Throws<RaftStorageException>();
+    }
+
+    [Test]
+    public async Task Snapshot_AboveTheApplicationSnapshot_IsTemporarilyUnavailable()
+    {
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        var entries = new Entry[10];
+        for (int i = 0; i < entries.Length; i++)
+        {
+            entries[i] = new Entry(EntryType.Normal, 1, (ulong)i + 1, default);
+        }
+
+        storage.Append(entries);
+        storage.SetHardState(new HardState(1, 0, 10));
+        Snapshot created = storage.CreateSnapshot(6, new ConfState(new ulong[] { 1 }), new byte[] { 6 });
+
+        // A position-only snapshot at the commit index would skip the commands after the application snapshot.
+        await Assert.That(storage.Snapshot(6)).IsSameReferenceAs(created);
+        RaftStorageException? error = null;
+        try
+        {
+            storage.Snapshot(7);
+        }
+        catch (RaftStorageException ex)
+        {
+            error = ex;
+        }
+
+        await Assert.That(error?.Error).IsEqualTo(RaftStorageError.SnapshotTemporarilyUnavailable);
+    }
+
+    [Test]
+    public async Task ApplySnapshot_OlderThanCreatedSnapshot_Throws()
+    {
+        var storage = new MemoryStorage();
+        storage.Append(new[]
+        {
+            new Entry(EntryType.Normal, 1, 1, default),
+            new Entry(EntryType.Normal, 1, 2, default),
+            new Entry(EntryType.Normal, 1, 3, default),
+        });
+        storage.CreateSnapshot(3, new ConfState(), default);
+
+        var older = new Snapshot(new SnapshotMetadata(2, 1, new ConfState()), default);
+        await Assert.That(() => storage.ApplySnapshot(older)).Throws<RaftStorageException>();
     }
 }

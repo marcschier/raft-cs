@@ -88,14 +88,15 @@ The current values are also available synchronously: `node.IsLeader`, `node.Lead
 
 ## Bound the log (compaction)
 
-The log grows with every committed command. Once your state machine has durably applied entries up to some index, discard the prefix so the on-disk log stays bounded:
+The log grows with every committed command. Snapshot your state machine at the index of the last item it applied, then discard the log up to that index so the retained log stays bounded. `FileRaftStorage` also shrinks its file when it can preserve the file's owner, group, and access control exactly:
 
 ```csharp
-// After persisting your state-machine state covering everything up to node.AppliedIndex:
-await node.CompactAsync(node.AppliedIndex);
+// appliedIndex is the CommittedItem.Index of the last item your state machine applied.
+await node.CreateSnapshotAsync(appliedIndex, SerializeMyState());
+await node.CompactAsync(appliedIndex);
 ```
 
-`CompactAsync` runs on the node's driver loop, so it is safe to call from any thread. A follower that falls behind the compacted boundary is re-seeded with a snapshot automatically — see [Snapshots and compaction](adoption.md#snapshots-and-log-compaction) for how to make snapshots carry your application state.
+Both run on the node's driver loop, so they are safe to call from any thread. A follower that falls behind the compacted boundary receives the snapshot, and its `CommittedItems` stream hands it to the state machine — see [Snapshots and compaction](adoption.md#snapshots-and-log-compaction).
 
 ## Persist across restarts
 
@@ -113,11 +114,13 @@ Unlike `MemoryStorage(ConfState)`, a *fresh* `FileRaftStorage` starts with **emp
 using var storage = new FileRaftStorage(new FileRaftStorageOptions("/var/lib/raft/node1"));
 if (storage.InitialState().ConfState.Voters.Count == 0)
 {
-    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 })); // bootstrap once
+    storage.SetConfState(new ConfState(new ulong[] { 1, 2, 3 }), 0); // bootstrap once, at index 0
 }
 
 var node = new RaftNode(config, storage, transport);
 ```
+
+Index 0 records that the membership precedes every log entry, so a membership change that commits just before a crash, and is not yet recorded, is applied on restart. The one-argument `SetConfState(confState)` is the compatible form; it leaves the index unknown, and a restarting node keeps the stored membership as it is.
 
 On a **restart**, the membership, log, and hard state are recovered from disk automatically — do not re-seed; just construct the node.
 

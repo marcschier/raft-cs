@@ -11,28 +11,53 @@ using Raft.Configuration;
 namespace Raft.Storage.File;
 
 /// <summary>A simple crash-safe file-backed implementation of <see cref="IRaftStorage"/>.</summary>
-public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
+public sealed class FileRaftStorage : IRaftSnapshotStorage, IRaftConfStateIndexStorage, IDisposable
 {
     private const string LogFileName = "log";
     private const string CompactingLogFileName = "log.compact";
     private const string HardStateFileName = "hardstate";
     private const string SnapshotFileName = "snapshot";
+    private const string NewSnapshotFileName = "snapshot.new";
+    private const string NewLogFileName = "log.new";
     private const byte EntryRecord = 0;
     private const byte TruncateRecord = 1;
     private const byte CompactRecord = 2;
     private const byte HardStateRecord = 3;
     private const byte BaseRecord = 4;
+    private const byte ConfStateIndexRecord = 5;
+    private const byte LogGenerationRecord = 6;
+    private const byte ConfStateRecord = 7;
     private const int LengthPrefixSize = 4;
     private const int EntryHeaderSize = 1 + 1 + 8 + 8 + 4;
     private const int HardStateRecordSize = 1 + (3 * 8);
     private const int BaseRecordSize = 1 + (2 * 8);
     private const int UInt64Size = 8;
 
+    // A compaction index no log reaches. Earlier readers fail on a compaction record with it; this store skips it.
+    private const ulong RollbackFenceIndex = ulong.MaxValue;
+
+    // Ends a snapshot file whose membership is the one at the snapshot's index. Earlier versions wrote no marker and
+    // rewrote the snapshot file with the latest membership on every SetConfState, keeping the snapshot's index.
+    private static readonly byte[] PointInTimeMembershipMarker =
+    {
+        (byte)'R', (byte)'S', (byte)'P', (byte)'M', 0, 0, 0, 1,
+    };
+
+    // Ends a snapshot file that, beyond the membership at its index, records before the marker the generation of the
+    // log that continues it. The snapshot supersedes every log of an earlier generation.
+    private static readonly byte[] LogGenerationMarker =
+    {
+        (byte)'R', (byte)'S', (byte)'P', (byte)'M', 0, 0, 0, 2,
+    };
+
     private readonly object _gate = new();
     private readonly string _logPath;
     private readonly string _compactingLogPath;
     private readonly string _hardStatePath;
     private readonly string _snapshotPath;
+    private readonly string _newSnapshotPath;
+    private readonly string _newLogPath;
+    private readonly string _directoryPath;
     private readonly bool _fsync;
     private readonly Action<string> _syncDirectory;
     private readonly StatxCall? _statx;
@@ -44,6 +69,18 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
     private bool _logWritable;
     private bool _replacementNeedsDirectorySync;
     private bool _expectsLegacyReaderRejectionRecord;
+    private ConfState _confState = new();
+    private ulong? _confStateIndex = 0;
+    private ulong? _pendingConfStateIndex;
+
+    // The generation of the log file: zero for a log written before generations were recorded.
+    private ulong _logGeneration;
+
+    // The generation of the log that continues the snapshot, or null when the snapshot file records none.
+    private ulong? _snapshotGeneration;
+
+    // Whether the log holds a rollback fence, which precedes its first configuration record.
+    private bool _logHasRollbackFence;
     private bool _disposed;
 
     /// <summary>Initializes a new instance of the <see cref="FileRaftStorage"/> class.</summary>
@@ -65,6 +102,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         // Resolve once: a later change of the working directory must not redirect a relative store's files.
         string directory = Path.GetFullPath(options.DirectoryPath);
         Directory.CreateDirectory(directory);
+        _directoryPath = directory;
         _fsync = options.Fsync;
         _syncDirectory = syncDirectory;
         _statx = statx;
@@ -73,19 +111,75 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         _compactingLogPath = Path.Combine(directory, CompactingLogFileName);
         _hardStatePath = Path.Combine(directory, HardStateFileName);
         _snapshotPath = Path.Combine(directory, SnapshotFileName);
+        _newLogPath = Path.Combine(directory, NewLogFileName);
+        _newSnapshotPath = Path.Combine(directory, NewSnapshotFileName);
 
         // A compacted log that was still being written when the process stopped is incomplete; the log it was to
         // replace is intact.
         System.IO.File.Delete(_compactingLogPath);
 
+        // A snapshot or log that was still being written beside the current one when the process stopped was never
+        // published; the current one is intact.
+        System.IO.File.Delete(_newSnapshotPath);
+        System.IO.File.Delete(_newLogPath);
+
         LoadSnapshot();
         LoadHardState();
-        ReplayLog(_logPath);
+        ulong logGeneration = ReadLogGeneration();
+        _logGeneration = logGeneration;
+        if (_snapshotGeneration is { } snapshotGeneration && logGeneration != snapshotGeneration)
+        {
+            if (logGeneration > snapshotGeneration)
+            {
+                throw new InvalidDataException(
+                    $"The log file '{_logPath}' continues a newer snapshot than the one in '{_snapshotPath}'.");
+            }
+
+            // The snapshot was installed, but the process stopped before the log it supersedes was replaced. Of that
+            // log only the hard state (term and vote) still holds; the installation is completed.
+            ReplayLog(hardStateOnly: true);
+            _logStream = OpenLog();
+            InitializeLogWrites();
+            try
+            {
+                InstallSnapshot(_snapshot, snapshotGeneration);
+            }
+            catch
+            {
+                _logStream.Dispose();
+                throw;
+            }
+
+            return;
+        }
+
+        long intactLength = ReplayLog(hardStateOnly: false);
         _logStream = OpenLog();
+        InitializeLogWrites();
+        if (_logStream.Length > intactLength)
+        {
+            // The bytes after the intact log are the torn last write: an incomplete record, or an index record whose
+            // configuration record is missing. Drop them, so the next record starts where a replay reads it and an
+            // index record is not paired with a configuration later written without an index.
+            try
+            {
+                _logStream.SetLength(intactLength);
+                FlushLog();
+                _logStream.Seek(0, SeekOrigin.End);
+            }
+            catch
+            {
+                _logStream.Dispose();
+                throw;
+            }
+        }
+    }
+
+    private void InitializeLogWrites()
+    {
         if (_fsync)
         {
-            // A previous process may have replaced the log and stopped before the directory entry was made durable;
-            // writes acknowledged before that sync could be lost with the replacement on power loss.
+            // A previous replacement may still need its directory entry made durable before writes are acknowledged.
             try
             {
                 SyncLogDirectory();
@@ -106,7 +200,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            return (_hardState, _snapshot.Metadata.ConfState);
+            return (_hardState, _confState);
         }
     }
 
@@ -187,11 +281,25 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            if (!_snapshot.IsEmpty && requestIndex <= _snapshot.Metadata.Index)
+            if (!_snapshot.IsEmpty)
             {
-                return _snapshot;
+                // A snapshot kept from an earlier version holds the application state but not the membership at its
+                // index, and the log before it is gone: a follower can be caught up only from a newer snapshot.
+                if (!_snapshot.MembershipIsAtIndex)
+                {
+                    throw new RaftStorageException(RaftStorageError.SnapshotTemporarilyUnavailable);
+                }
+
+                if (requestIndex <= _snapshot.Metadata.Index)
+                {
+                    return _snapshot;
+                }
+
+                // A snapshot without the application state would skip the commands after this one.
+                throw new RaftStorageException(RaftStorageError.SnapshotTemporarilyUnavailable);
             }
 
+            // Without an application snapshot, the store has no application state to send: only the position.
             ulong appliedIndex = _hardState.Commit;
             if (requestIndex > appliedIndex)
             {
@@ -199,7 +307,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             }
 
             ulong term = TermLocked(appliedIndex);
-            var metadata = new SnapshotMetadata(appliedIndex, term, _snapshot.Metadata.ConfState);
+            var metadata = new SnapshotMetadata(appliedIndex, term, _confState);
             return new Snapshot(metadata, ReadOnlyMemory<byte>.Empty);
         }
     }
@@ -318,14 +426,128 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
         }
 
-        WriteSnapshot(snapshot);
-        ResetLogFile();
-        _snapshot = CopySnapshot(snapshot);
+        // Earlier readers ignore the generation the snapshot names, so until the log is replaced they would replay
+        // the superseded log after the new snapshot: the log is fenced before the snapshot is published.
+        if (!_logHasRollbackFence)
+        {
+            WriteRollbackFence();
+            FlushLog();
+            _logHasRollbackFence = true;
+        }
+
+        // The snapshot names the next log generation and is published first: a reopen after a crash before the log
+        // it supersedes is replaced completes the installation.
+        ulong generation = _logGeneration + 1;
+        WriteSnapshot(snapshot, generation);
+        InstallSnapshot(CopySnapshot(snapshot), generation);
+    }
+
+    /// <summary>
+    /// Takes over a published snapshot that supersedes the log, and replaces the log with one of
+    /// <paramref name="generation"/> that holds only the state the snapshot leaves.
+    /// </summary>
+    private void InstallSnapshot(Snapshot snapshot, ulong generation)
+    {
+        ulong index = snapshot.Metadata.Index;
+        _snapshot = snapshot;
+        _snapshotGeneration = generation;
+        _confState = snapshot.Metadata.ConfState;
+        _confStateIndex = index;
         _entries.Clear();
-        _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, snapshot.Metadata.Index, default));
+        _entries.Add(new Entry(EntryType.Normal, snapshot.Metadata.Term, index, default));
         _hardState = new HardState(Math.Max(_hardState.Term, snapshot.Metadata.Term), _hardState.Vote, index);
-        WriteHardStateRecord(_hardState);
-        FlushLog();
+        ReplaceLog(generation, index);
+    }
+
+    /// <summary>
+    /// Writes a log of <paramref name="generation"/> beside the current one and swaps it in, so after a crash either
+    /// the former or the new log is in place. A log written whole starts with its generation record, which is read
+    /// before the log is replayed, and holds the membership after a rollback fence; any rewrite of the log keeps both.
+    /// </summary>
+    private void ReplaceLog(ulong generation, ulong confStateIndex)
+    {
+        FileStream current = _logStream;
+        using (var next = new FileStream(_newLogPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            _logStream = next;
+            try
+            {
+                WriteLogGenerationRecord(generation);
+                WriteRollbackFence();
+                WriteConfStateRecords(_confState, confStateIndex);
+                WriteHardStateRecord(_hardState);
+                FlushLog();
+            }
+            finally
+            {
+                _logStream = current;
+            }
+        }
+
+        current.Dispose();
+        try
+        {
+            PublishFile(_newLogPath, _logPath, "log");
+        }
+        finally
+        {
+            _logStream = OpenLog();
+        }
+
+        _logGeneration = generation;
+        _logHasRollbackFence = true;
+    }
+
+    private FileStream OpenLog()
+    {
+        var stream = new FileStream(_logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        stream.Seek(0, SeekOrigin.End);
+        return stream;
+    }
+
+    /// <inheritdoc/>
+    public Snapshot CreateSnapshot(ulong index, ConfState confState, ReadOnlyMemory<byte> data)
+    {
+        ThrowIfNull(confState);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            EnsureLogWritable();
+            if (index <= _snapshot.Metadata.Index)
+            {
+                throw new RaftStorageException(RaftStorageError.SnapshotOutOfDate);
+            }
+
+            ulong term = TermLocked(index);
+            var snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), data.ToArray());
+            if (!_snapshot.MembershipIsAtIndex)
+            {
+                // The current membership is stored only in the snapshot file this one replaces; keep it in the log.
+                AppendConfStateRecords(_confState, _confStateIndex);
+                FlushLog();
+            }
+
+            // The log continues after this snapshot, so the snapshot names the log's own generation.
+            WriteSnapshot(snapshot, _logGeneration);
+            _snapshot = snapshot;
+            _snapshotGeneration = _logGeneration;
+            return snapshot;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// A snapshot kept from an earlier version of this store holds the latest membership the store recorded, not
+    /// necessarily the one at its index.
+    /// </remarks>
+    public Snapshot? LatestSnapshot()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            return _snapshot.IsEmpty ? null : _snapshot;
+        }
     }
 
     /// <summary>
@@ -371,7 +593,11 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         }
     }
 
-    /// <summary>Overwrites the persisted committed configuration.</summary>
+    /// <summary>
+    /// Overwrites the persisted committed configuration. The index it reflects becomes unknown:
+    /// <see cref="ConfStateIndex"/> returns <see langword="null"/>, also after the store is reopened, until the next
+    /// <see cref="SetConfState(ConfState, ulong)"/> or snapshot installation.
+    /// </summary>
     /// <param name="confState">The configuration to store.</param>
     public void SetConfState(ConfState confState)
     {
@@ -381,9 +607,36 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         {
             ThrowIfDisposed();
             EnsureLogWritable();
-            SnapshotMetadata metadata = _snapshot.Metadata;
-            _snapshot = new Snapshot(new SnapshotMetadata(metadata.Index, metadata.Term, confState), _snapshot.Data);
-            WriteSnapshot(_snapshot);
+            _confState = confState;
+            _confStateIndex = null;
+            AppendConfStateRecords(confState, index: null);
+            FlushLog();
+        }
+    }
+
+    /// <inheritdoc/>
+    public void SetConfState(ConfState confState, ulong index)
+    {
+        ThrowIfNull(confState);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            EnsureLogWritable();
+            _confState = confState;
+            _confStateIndex = index;
+            AppendConfStateRecords(confState, index);
+            FlushLog();
+        }
+    }
+
+    /// <inheritdoc/>
+    public ulong? ConfStateIndex()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            return _confStateIndex;
         }
     }
 
@@ -514,10 +767,12 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             return;
         }
 
+        // The snapshot file is replaced as a whole, never written in place, so a damaged one is not a torn write. It
+        // holds the application state, so it is refused rather than ignored.
         byte[] data = System.IO.File.ReadAllBytes(_snapshotPath);
         if (data.Length < 8 + 8 + 4)
         {
-            return;
+            throw DamagedSnapshot();
         }
 
         int offset = 0;
@@ -527,20 +782,41 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         offset += 4;
         if (dataLength < 0 || data.Length < offset + dataLength)
         {
-            return;
+            throw DamagedSnapshot();
         }
 
         byte[] snapshotData = data.AsSpan(offset, dataLength).ToArray();
         offset += dataLength;
         if (!TryReadConfState(data, ref offset, out ConfState? confState) || confState is null)
         {
-            return;
+            throw DamagedSnapshot();
         }
 
-        _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData);
+        // Without a marker, an earlier version wrote the file: its membership is the latest one the store recorded,
+        // not the one at the snapshot's index, so the index that membership reflects is unknown. Only the second
+        // marker records the generation of the log that continues the snapshot.
+        ReadOnlySpan<byte> trailer = data.AsSpan(offset);
+        bool membershipIsAtIndex = !trailer.IsEmpty;
+        if (trailer.Length == UInt64Size + LogGenerationMarker.Length
+            && trailer.Slice(UInt64Size).SequenceEqual(LogGenerationMarker))
+        {
+            int generationOffset = 0;
+            _snapshotGeneration = ReadUInt64(trailer, ref generationOffset);
+        }
+        else if (membershipIsAtIndex && !trailer.SequenceEqual(PointInTimeMembershipMarker))
+        {
+            throw DamagedSnapshot();
+        }
+
+        _snapshot = new Snapshot(new SnapshotMetadata(index, term, confState), snapshotData, membershipIsAtIndex);
+        _confState = confState;
+        _confStateIndex = membershipIsAtIndex ? index : null;
         _entries.Clear();
         _entries.Add(new Entry(EntryType.Normal, term, index, default));
     }
+
+    private InvalidDataException DamagedSnapshot() =>
+        new($"The snapshot file '{_snapshotPath}' is damaged.");
 
     private void LoadHardState()
     {
@@ -562,19 +838,51 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         _hardState = new HardState(term, vote, commit);
     }
 
-    private void ReplayLog(string logPath)
+    /// <summary>
+    /// Returns the generation the log file records in its first record, or zero when it records none: the log was
+    /// written before generations were recorded, or never replaced by an installed snapshot.
+    /// </summary>
+    private ulong ReadLogGeneration()
     {
-        if (!System.IO.File.Exists(logPath))
+        if (!System.IO.File.Exists(_logPath))
         {
-            return;
+            return 0;
         }
 
-        using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var stream = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var record = new byte[LengthPrefixSize + 1 + UInt64Size];
+        if (!ReadExactly(stream, record, 0, record.Length)
+            || BinaryPrimitives.ReadInt32BigEndian(record) != 1 + UInt64Size
+            || record[LengthPrefixSize] != LogGenerationRecord)
+        {
+            return 0;
+        }
+
+        int offset = LengthPrefixSize + 1;
+        return ReadUInt64(record, ref offset);
+    }
+
+    /// <summary>
+    /// Replays the log records into memory, or only its hard state records when <paramref name="hardStateOnly"/>;
+    /// returns the length of the intact log: the end of the last complete record, before a trailing index record whose
+    /// configuration record is missing.
+    /// </summary>
+    private long ReplayLog(bool hardStateOnly)
+    {
+        if (!System.IO.File.Exists(_logPath))
+        {
+            return 0;
+        }
+
+        using var stream = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        long fileLength = stream.Length;
         var lengthBuffer = new byte[LengthPrefixSize];
+        long intactLength = 0;
         while (ReadExactly(stream, lengthBuffer, 0, lengthBuffer.Length))
         {
+            // A record that does not fit in the file is the torn last write, and so may be its length prefix.
             int length = BinaryPrimitives.ReadInt32BigEndian(lengthBuffer);
-            if (length <= 0)
+            if (length <= 0 || length > fileLength - stream.Position)
             {
                 break;
             }
@@ -585,8 +893,20 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                 break;
             }
 
-            ReplayRecord(payload);
+            if (!hardStateOnly || payload[0] == HardStateRecord)
+            {
+                ReplayRecord(payload);
+            }
+
+            // An index record is intact only together with the configuration record written right after it.
+            if (_pendingConfStateIndex is null)
+            {
+                intactLength = stream.Position;
+            }
         }
+
+        _pendingConfStateIndex = null;
+        return intactLength;
     }
 
     private static bool ReadExactly(Stream stream, byte[] buffer, int offset, int count)
@@ -614,6 +934,9 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
             _expectsLegacyReaderRejectionRecord = false;
         }
 
+        // An index record belongs to the configuration record written right after it.
+        ulong? confStateIndex = _pendingConfStateIndex;
+        _pendingConfStateIndex = null;
         switch (payload[0])
         {
             case EntryRecord:
@@ -656,8 +979,18 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                     }
 
                     _expectsLegacyReaderRejectionRecord = false;
-                    Entry boundary = CompactCore(compactIndex);
-                    _entries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
+                    if (compactIndex == RollbackFenceIndex)
+                    {
+                        _logHasRollbackFence = true;
+                        break;
+                    }
+
+                    // A snapshot recorded after this compaction already covers it.
+                    if (compactIndex > _entries[0].Index)
+                    {
+                        Entry boundary = CompactCore(compactIndex);
+                        _entries[0] = new Entry(EntryType.Normal, boundary.Term, boundary.Index, default);
+                    }
                 }
 
                 break;
@@ -669,6 +1002,26 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
                     ulong vote = ReadUInt64(payload, ref offset);
                     ulong commit = ReadUInt64(payload, ref offset);
                     _hardState = new HardState(term, vote, commit);
+                }
+
+                break;
+            case ConfStateRecord:
+                int confStateOffset = 1;
+                if (TryReadConfState(payload, ref confStateOffset, out ConfState? confState)
+                    && confState is not null
+                    && confStateOffset == payload.Length)
+                {
+                    // A configuration without an index record right before it was stored with an unknown index.
+                    _confState = confState;
+                    _confStateIndex = confStateIndex;
+                }
+
+                break;
+            case ConfStateIndexRecord:
+                if (payload.Length == 1 + UInt64Size)
+                {
+                    int offset = 1;
+                    _pendingConfStateIndex = ReadUInt64(payload, ref offset);
                 }
 
                 break;
@@ -728,6 +1081,51 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         WriteRecord(stream, payload);
     }
 
+    private void WriteRollbackFence()
+    {
+        // Readers before this format ignore the configuration records that follow; they fail on this compaction
+        // record instead of opening the store with an earlier membership.
+        WriteCompactRecord(_logStream, RollbackFenceIndex);
+    }
+
+    /// <summary>Appends configuration records to the log, after a rollback fence when the log holds none yet.</summary>
+    private void AppendConfStateRecords(ConfState confState, ulong? index)
+    {
+        if (!_logHasRollbackFence)
+        {
+            WriteRollbackFence();
+            _logHasRollbackFence = true;
+        }
+
+        WriteConfStateRecords(confState, index);
+    }
+
+    /// <summary>
+    /// Writes the index record, when the index is known, then the configuration record it belongs to. A configuration
+    /// record without an index record right before it has an unknown index; an index record without its configuration
+    /// record is dropped on open.
+    /// </summary>
+    private void WriteConfStateRecords(ConfState confState, ulong? index) =>
+        WriteConfStateRecords(_logStream, confState, index);
+
+    private static void WriteConfStateRecords(Stream stream, ConfState confState, ulong? index)
+    {
+        if (index is { } knownIndex)
+        {
+            Span<byte> indexPayload = stackalloc byte[1 + UInt64Size];
+            indexPayload[0] = ConfStateIndexRecord;
+            int indexOffset = 1;
+            WriteUInt64(indexPayload, ref indexOffset, knownIndex);
+            WriteRecord(stream, indexPayload);
+        }
+
+        byte[] payload = new byte[1 + ConfStateLength(confState)];
+        payload[0] = ConfStateRecord;
+        int offset = 1;
+        WriteConfState(payload, ref offset, confState);
+        WriteRecord(stream, payload);
+    }
+
     private void WriteEntryRecord(Entry entry) => WriteEntryRecord(_logStream, entry);
 
     private static void WriteEntryRecord(Stream stream, Entry entry)
@@ -764,13 +1162,6 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         _logStream.Flush(_fsync);
     }
 
-    private FileStream OpenLog()
-    {
-        var stream = new FileStream(_logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        stream.Seek(0, SeekOrigin.End);
-        return stream;
-    }
-
     /// <summary>
     /// Replaces the log file with one that holds only the retained log: the compaction boundary, the entries after it,
     /// and the hard state. Any other state the log records, and any record a log must start with, is carried into the
@@ -787,8 +1178,11 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 
         using (FileStream compacted = staged)
         {
+            WriteLogGenerationRecord(compacted, _logGeneration);
             WriteBaseRecord(compacted, compactedEntries[0]);
             WriteLegacyReaderRejectionRecord(compacted);
+            WriteCompactRecord(compacted, RollbackFenceIndex);
+            WriteConfStateRecords(compacted, _confState, _confStateIndex);
             for (int i = 1; i < compactedEntries.Count; i++)
             {
                 WriteEntryRecord(compacted, compactedEntries[i]);
@@ -823,6 +1217,7 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
 
         _entries.Clear();
         _entries.AddRange(compactedEntries);
+        _logHasRollbackFence = true;
 
         if (_fsync)
         {
@@ -951,16 +1346,21 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         DirectorySync.Sync(directoryPath);
     }
 
-    private void ResetLogFile()
+    private void WriteLogGenerationRecord(ulong generation) => WriteLogGenerationRecord(_logStream, generation);
+
+    private static void WriteLogGenerationRecord(Stream stream, ulong generation)
     {
-        _logStream.SetLength(0);
-        _logStream.Seek(0, SeekOrigin.Begin);
-        FlushLog();
+        Span<byte> payload = stackalloc byte[1 + UInt64Size];
+        payload[0] = LogGenerationRecord;
+        int offset = 1;
+        WriteUInt64(payload, ref offset, generation);
+        WriteRecord(stream, payload);
     }
 
-    private void WriteSnapshot(Snapshot snapshot)
+    private void WriteSnapshot(Snapshot snapshot, ulong logGeneration)
     {
-        int length = 8 + 8 + 4 + snapshot.Data.Length + ConfStateLength(snapshot.Metadata.ConfState);
+        int length = 8 + 8 + 4 + snapshot.Data.Length + ConfStateLength(snapshot.Metadata.ConfState)
+            + UInt64Size + LogGenerationMarker.Length;
         byte[] data = new byte[length];
         int offset = 0;
         WriteUInt64(data, ref offset, snapshot.Metadata.Index);
@@ -970,15 +1370,100 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         snapshot.Data.Span.CopyTo(data.AsSpan(offset));
         offset += snapshot.Data.Length;
         WriteConfState(data, ref offset, snapshot.Metadata.ConfState);
-        WriteAllBytesDurable(_snapshotPath, data);
+
+        // After every field an earlier version reads, which ignores the bytes that follow.
+        WriteUInt64(data, ref offset, logGeneration);
+        LogGenerationMarker.CopyTo(data, offset);
+
+        // Written beside the snapshot and then swapped in, so after a crash either the former or the new snapshot is
+        // in place.
+        using (var stream = new FileStream(_newSnapshotPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            stream.Write(data, 0, data.Length);
+            stream.Flush(_fsync);
+        }
+
+        PublishFile(_newSnapshotPath, _snapshotPath, "snapshot");
     }
 
-    private void WriteAllBytesDurable(string path, byte[] data)
+    /// <summary>Replaces <paramref name="path"/> with the durable file <paramref name="newPath"/>.</summary>
+    private void PublishFile(string newPath, string path, string kind)
     {
-        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
-        stream.Write(data, 0, data.Length);
-        stream.Flush(_fsync);
+        if (_fsync && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            if (!MoveFileEx(newPath, path, MoveFileReplaceExisting | MoveFileWriteThrough))
+            {
+                throw new IOException($"Could not publish {kind} durably (error {Marshal.GetLastWin32Error()}).");
+            }
+        }
+        else if (System.IO.File.Exists(path))
+        {
+            System.IO.File.Replace(newPath, path, destinationBackupFileName: null);
+        }
+        else
+        {
+            System.IO.File.Move(newPath, path);
+        }
+
+        FlushDirectory();
     }
+
+    private void FlushDirectory()
+    {
+        if (!_fsync)
+        {
+            return;
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            // MoveFileEx with MOVEFILE_WRITE_THROUGH publishes the rename synchronously on Windows, where
+            // FlushFileBuffers rejects directory handles.
+            return;
+        }
+
+        int directory = Open(_directoryPath, OpenReadOnly);
+        if (directory < 0)
+        {
+            throw new IOException($"Could not open store directory for syncing (error {Marshal.GetLastWin32Error()}).");
+        }
+
+        int closeResult = 0;
+        try
+        {
+            if (Fsync(directory) != 0)
+            {
+                throw new IOException($"Could not sync store directory (error {Marshal.GetLastWin32Error()}).");
+            }
+        }
+        finally
+        {
+            closeResult = Close(directory);
+        }
+
+        if (closeResult != 0)
+        {
+            throw new IOException(
+                $"Could not close store directory after syncing (error {Marshal.GetLastWin32Error()}).");
+        }
+    }
+
+    private const uint MoveFileReplaceExisting = 0x00000001;
+    private const uint MoveFileWriteThrough = 0x00000008;
+    private const int OpenReadOnly = 0;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileEx(string existingFileName, string newFileName, uint flags);
+
+    [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    private static extern int Open(string path, int flags);
+
+    [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
+    private static extern int Fsync(int fileDescriptor);
+
+    [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+    private static extern int Close(int fileDescriptor);
 
     private ulong TermLocked(ulong index)
     {
@@ -986,6 +1471,12 @@ public sealed class FileRaftStorage : IRaftWritableStorage, IDisposable
         if (index < offset)
         {
             throw new RaftStorageException(RaftStorageError.Compacted);
+        }
+
+        // Checked before the narrowing cast below, which would wrap for an index far past the log.
+        if (index > LastIndexLocked())
+        {
+            throw new RaftStorageException(RaftStorageError.Unavailable);
         }
 
         int i = (int)(index - offset);
