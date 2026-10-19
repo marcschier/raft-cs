@@ -76,15 +76,19 @@ dotnet test --solution Raft.slnx -c Release
 - [Wire format](docs/wire-format.md)
 - [API reference](docs/api.md)
 
-## Release 1.1.3
+## Release 1.1.4
 
-Updates the NanoMsg transport to NanoMsgSharp 1.1.3 and refreshes the .NET 10 servicing SDK,
-BCL dependencies, analyzers, test tooling, CI actions, and Rust harness dependencies. Public APIs,
-target frameworks, strong-name identity, and the stable version suffix remain unchanged.
-Package metadata now identifies this repository. Releases publish all four packages to GitHub
-Packages only after every CI gate passes, then promote those same packages to nuget.org.
-The broadcast test collects concurrent peer callbacks in a thread-safe collection; production
-delivery behavior and all delivery assertions remain unchanged.
+Adds `CommittedItems` with each command's log index and term, application snapshot creation,
+snapshot delivery to lagging followers, and snapshot restoration before replay on restart.
+File storage compaction now bounds disk use when the file's access rules can be preserved,
+while retaining snapshot generation, membership, and hard state. Recovery validates damaged
+snapshots and incomplete log writes, and stopped nodes fail pending snapshot requests.
+Existing payload-only consumers can continue using `Committed`.
+
+Stores written with the new membership and compaction formats require a compatible reader;
+see the [upgrade and rollback guidance](docs/architecture.md#raftlog-and-storage).
+Releases publish all four packages to GitHub Packages only after every CI gate passes,
+then promote those same packages to nuget.org.
 
 ## 🧪 Samples & Interop
 
