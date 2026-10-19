@@ -267,6 +267,22 @@ public sealed partial class RaftCore
     /// <param name="index">The highest applied index.</param>
     public void AppliedTo(ulong index) => _log.AppliedTo(index);
 
+    /// <summary>
+    /// Marks the log committed and applied up to a snapshot the application restores on start. A snapshot holds only
+    /// applied, hence committed, entries.
+    /// </summary>
+    /// <param name="index">The snapshot index.</param>
+    internal void RestoreAppliedTo(ulong index)
+    {
+        if (index <= _log.Applied)
+        {
+            return;
+        }
+
+        _log.CommitTo(index);
+        _log.AppliedTo(index);
+    }
+
     /// <summary>Advances the logical clock by one tick.</summary>
     public void Tick()
     {

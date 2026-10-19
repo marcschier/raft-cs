@@ -35,9 +35,22 @@ public sealed class Snapshot
     /// <param name="metadata">The snapshot metadata.</param>
     /// <param name="data">The opaque state-machine bytes.</param>
     public Snapshot(SnapshotMetadata metadata, ReadOnlyMemory<byte> data)
+        : this(metadata, data, membershipIsAtIndex: true)
+    {
+    }
+
+    /// <summary>Initializes a new instance of the <see cref="Snapshot"/> class.</summary>
+    /// <param name="metadata">The snapshot metadata.</param>
+    /// <param name="data">The opaque state-machine bytes.</param>
+    /// <param name="membershipIsAtIndex">
+    /// Whether <see cref="SnapshotMetadata.ConfState"/> is the membership at <see cref="SnapshotMetadata.Index"/>,
+    /// rather than a later one with an unknown index.
+    /// </param>
+    internal Snapshot(SnapshotMetadata metadata, ReadOnlyMemory<byte> data, bool membershipIsAtIndex)
     {
         Metadata = metadata;
         Data = data;
+        MembershipIsAtIndex = membershipIsAtIndex;
     }
 
     /// <summary>Gets the snapshot metadata.</summary>
@@ -48,4 +61,11 @@ public sealed class Snapshot
 
     /// <summary>Gets a value indicating whether the snapshot carries no position (an empty snapshot).</summary>
     public bool IsEmpty => Metadata.Index == 0;
+
+    /// <summary>
+    /// Gets a value indicating whether <see cref="SnapshotMetadata.ConfState"/> is the membership at
+    /// <see cref="SnapshotMetadata.Index"/>. A snapshot a store kept from an earlier version may hold a later
+    /// membership, whose index is unknown; its application state and index are still valid.
+    /// </summary>
+    internal bool MembershipIsAtIndex { get; }
 }
