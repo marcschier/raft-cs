@@ -76,6 +76,10 @@ dotnet test --solution Raft.slnx -c Release
 - [Wire format](docs/wire-format.md)
 - [API reference](docs/api.md)
 
+## Release 1.1.5
+
+Updates the .NET 10 SDK and servicing dependencies, refreshes TUnit, and updates the NanoMsg transport dependency to NanoMsgSharp 1.1.4.
+
 ## Release 1.1.4
 
 Adds `CommittedItems` with each command's log index and term, application snapshot creation,
