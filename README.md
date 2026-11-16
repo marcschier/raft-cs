@@ -76,6 +76,11 @@ dotnet test --solution Raft.slnx -c Release
 - [Wire format](docs/wire-format.md)
 - [API reference](docs/api.md)
 
+## Release 1.1.6
+
+Updates .NET 10 servicing dependencies, refreshes the test framework and polyfills, updates the
+NanoMsg transport dependency to NanoMsgSharp 1.1.5, and refreshes the Rust interop dependencies.
+
 ## Release 1.1.5
 
 Updates the .NET 10 SDK and servicing dependencies, refreshes TUnit, and updates the NanoMsg transport dependency to NanoMsgSharp 1.1.4.
