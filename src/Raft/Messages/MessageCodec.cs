@@ -7,18 +7,22 @@ using Raft.Storage;
 namespace Raft.Messages;
 
 /// <summary>
-/// A compact, allocation-free big-endian binary codec for <see cref="Message"/>. Encoding writes directly into a
-/// caller buffer via <see cref="System.Span{T}"/>/<see cref="BinaryPrimitives"/>; decoding validates every length.
+/// A compact big-endian binary codec for <see cref="Message"/>. Encoding writes directly into a caller buffer
+/// via <see cref="System.Span{T}"/>/<see cref="BinaryPrimitives"/>; decoding validates lengths before allocating.
 /// </summary>
 public static class MessageCodec
 {
     private const byte FlagReject = 0x01;
     private const byte FlagSnapshot = 0x02;
     private const int FixedHeader = 1 + (8 * 8) + 1 + 4; // type + 8 u64 + flags + entryCount
+    private const int EntryHeader = 1 + 8 + 8 + 4;
+    private const int SnapshotHeader = 8 + 8 + 4;
+    private const int ConfStateHeader = 1 + (4 * sizeof(int));
 
     /// <summary>Computes the exact encoded size of <paramref name="message"/>.</summary>
     /// <param name="message">The message to measure.</param>
     /// <returns>The number of bytes <see cref="TryWrite"/> will produce.</returns>
+    /// <exception cref="OverflowException">The length cannot be represented as an <see cref="int"/>.</exception>
     public static int EncodedLength(Message message)
     {
         Internal.Check.NotNull(message);
@@ -27,13 +31,13 @@ public static class MessageCodec
         IReadOnlyList<Entry> entries = message.Entries;
         for (int i = 0; i < entries.Count; i++)
         {
-            length += 1 + 8 + 8 + 4 + entries[i].Data.Length;
+            length = checked(length + EntryHeader + entries[i].Data.Length);
         }
 
         if (message.Snapshot is { } snapshot)
         {
-            length += 8 + 8 + 4 + snapshot.Data.Length;
-            length += ConfStateLength(snapshot.Metadata.ConfState);
+            length = checked(length + SnapshotHeader + snapshot.Data.Length
+                + ConfStateLength(snapshot.Metadata.ConfState));
         }
 
         return length;
@@ -112,7 +116,7 @@ public static class MessageCodec
     public static bool TryParse(ReadOnlySpan<byte> source, out Message? message)
     {
         message = null;
-        if (source.Length < FixedHeader)
+        if (source.Length < FixedHeader || source[0] > (byte)MessageType.TimeoutNow)
         {
             return false;
         }
@@ -129,11 +133,23 @@ public static class MessageCodec
         result.Context = ReadUInt64(source, ref offset);
 
         byte flags = source[offset++];
+        if ((flags & ~(FlagReject | FlagSnapshot)) != 0)
+        {
+            return false;
+        }
+
         result.Reject = (flags & FlagReject) != 0;
+        bool hasSnapshot = (flags & FlagSnapshot) != 0;
+        int snapshotMinimum = hasSnapshot ? SnapshotHeader + ConfStateHeader : 0;
 
         int entryCount = BinaryPrimitives.ReadInt32BigEndian(source.Slice(offset));
         offset += 4;
-        if (entryCount < 0)
+        int remaining = source.Length - offset - snapshotMinimum;
+        if (remaining < 0
+            || entryCount < 0
+            || entryCount > remaining / EntryHeader
+            || (entryCount != 0 && result.Type is not (MessageType.Append or MessageType.Propose))
+            || hasSnapshot != (result.Type == MessageType.Snapshot))
         {
             return false;
         }
@@ -143,7 +159,8 @@ public static class MessageCodec
             var entries = new Entry[entryCount];
             for (int i = 0; i < entryCount; i++)
             {
-                if (source.Length < offset + 1 + 8 + 8 + 4)
+                int headersAfterThis = ((entryCount - i - 1) * EntryHeader) + snapshotMinimum;
+                if (source.Length - offset - headersAfterThis < EntryHeader)
                 {
                     return false;
                 }
@@ -153,7 +170,9 @@ public static class MessageCodec
                 ulong index = ReadUInt64(source, ref offset);
                 int dataLen = BinaryPrimitives.ReadInt32BigEndian(source.Slice(offset));
                 offset += 4;
-                if (dataLen < 0 || source.Length < offset + dataLen)
+                if (type > EntryType.ConfChangeV2
+                    || dataLen < 0
+                    || dataLen > source.Length - offset - headersAfterThis)
                 {
                     return false;
                 }
@@ -165,30 +184,30 @@ public static class MessageCodec
             result.Entries = entries;
         }
 
-        if ((flags & FlagSnapshot) != 0)
+        if (hasSnapshot)
         {
-            if (source.Length < offset + 8 + 8 + 4)
-            {
-                return false;
-            }
-
             ulong snapIndex = ReadUInt64(source, ref offset);
             ulong snapTerm = ReadUInt64(source, ref offset);
             int dataLen = BinaryPrimitives.ReadInt32BigEndian(source.Slice(offset));
             offset += 4;
-            if (dataLen < 0 || source.Length < offset + dataLen)
+            if (dataLen < 0 || dataLen > source.Length - offset - ConfStateHeader)
             {
                 return false;
             }
 
-            byte[] data = source.Slice(offset, dataLen).ToArray();
+            ReadOnlySpan<byte> data = source.Slice(offset, dataLen);
             offset += dataLen;
             if (!TryReadConfState(source, ref offset, out ConfState? confState) || confState is null)
             {
                 return false;
             }
 
-            result.Snapshot = new Snapshot(new SnapshotMetadata(snapIndex, snapTerm, confState), data);
+            result.Snapshot = new Snapshot(new SnapshotMetadata(snapIndex, snapTerm, confState), data.ToArray());
+        }
+
+        if (offset != source.Length)
+        {
+            return false;
         }
 
         message = result;
@@ -197,11 +216,11 @@ public static class MessageCodec
 
     private static int ConfStateLength(ConfState confState)
     {
-        return 1
-            + 4 + (confState.Voters.Count * 8)
-            + 4 + (confState.Learners.Count * 8)
-            + 4 + (confState.VotersOutgoing.Count * 8)
-            + 4 + (confState.LearnersNext.Count * 8);
+        return checked(ConfStateHeader
+            + (confState.Voters.Count * sizeof(ulong))
+            + (confState.Learners.Count * sizeof(ulong))
+            + (confState.VotersOutgoing.Count * sizeof(ulong))
+            + (confState.LearnersNext.Count * sizeof(ulong)));
     }
 
     private static void WriteConfState(Span<byte> destination, ref int offset, ConfState confState)
@@ -216,16 +235,16 @@ public static class MessageCodec
     private static bool TryReadConfState(ReadOnlySpan<byte> source, ref int offset, out ConfState? confState)
     {
         confState = null;
-        if (source.Length < offset + 1)
+        if (source.Length - offset < ConfStateHeader || source[offset] > 1)
         {
             return false;
         }
 
         bool autoLeave = source[offset++] != 0;
-        if (!TryReadIds(source, ref offset, out ulong[]? voters)
-            || !TryReadIds(source, ref offset, out ulong[]? learners)
-            || !TryReadIds(source, ref offset, out ulong[]? votersOutgoing)
-            || !TryReadIds(source, ref offset, out ulong[]? learnersNext))
+        if (!TryReadIds(source, ref offset, 3 * sizeof(int), out ulong[]? voters)
+            || !TryReadIds(source, ref offset, 2 * sizeof(int), out ulong[]? learners)
+            || !TryReadIds(source, ref offset, sizeof(int), out ulong[]? votersOutgoing)
+            || !TryReadIds(source, ref offset, 0, out ulong[]? learnersNext))
         {
             return false;
         }
@@ -244,17 +263,17 @@ public static class MessageCodec
         }
     }
 
-    private static bool TryReadIds(ReadOnlySpan<byte> source, ref int offset, out ulong[]? ids)
+    private static bool TryReadIds(ReadOnlySpan<byte> source, ref int offset, int reservedBytes, out ulong[]? ids)
     {
         ids = null;
-        if (source.Length < offset + 4)
+        if (source.Length - offset < sizeof(int) + reservedBytes)
         {
             return false;
         }
 
         int count = BinaryPrimitives.ReadInt32BigEndian(source.Slice(offset));
         offset += 4;
-        if (count < 0 || source.Length < offset + (count * 8))
+        if (count < 0 || count > (source.Length - offset - reservedBytes) / sizeof(ulong))
         {
             return false;
         }

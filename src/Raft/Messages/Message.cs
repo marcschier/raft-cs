@@ -11,7 +11,7 @@ public enum MessageType : byte
     /// <summary>Local signal: the leader should broadcast a heartbeat.</summary>
     Beat = 1,
 
-    /// <summary>Local signal: append the carried entries as the leader.</summary>
+    /// <summary>Proposal to append entries, submitted locally or forwarded by a cluster member.</summary>
     Propose = 2,
 
     /// <summary>Leader-to-follower log replication (AppendEntries).</summary>
@@ -41,7 +41,7 @@ public enum MessageType : byte
     /// <summary>Leader-to-follower snapshot install.</summary>
     Snapshot = 11,
 
-    /// <summary>Leader signal handing leadership to a target.</summary>
+    /// <summary>Local request for the leader to hand leadership to a target.</summary>
     TransferLeader = 12,
 
     /// <summary>Leader instruction telling a follower to start an election immediately.</summary>
@@ -60,7 +60,8 @@ public sealed class Message
     /// <summary>Gets or sets the recipient node id.</summary>
     public ulong To { get; set; }
 
-    /// <summary>Gets or sets the sender term (zero for local signals).</summary>
+    /// <summary>Gets or sets the sender term (zero for local signals and forwarded proposals).</summary>
+    /// <remarks>Append and heartbeat responses must also carry a term; termless responses are not dispatched.</remarks>
     public ulong Term { get; set; }
 
     /// <summary>Gets or sets the term of the entry preceding <see cref="Index"/> (log/last-log term).</summary>

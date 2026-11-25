@@ -2,6 +2,7 @@
 
 using System.Text;
 using Raft.Configuration;
+using Raft.Messages;
 using Raft.Storage;
 using Raft.Transport;
 
@@ -9,6 +10,150 @@ namespace Raft.Tests;
 
 public sealed class RaftNodeSnapshotDeliveryTests
 {
+    [Test]
+    public async Task SeededJoiningLearnerCatchesUpThroughACompactedLeader()
+    {
+        await using var network = new InMemoryNetwork();
+        var initial = new ConfState(new ulong[] { 1 });
+        await using RaftNode leader = CreateSingleNode(network, new MemoryStorage(initial));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        CancellationToken ct = timeout.Token;
+        await StartLeaderAsync(leader, ct);
+        await leader.ProposeAsync(new byte[] { 1 }, ct);
+        CommittedItem beforeJoin = await leader.CommittedItems.ReadAsync(ct);
+        await leader.CreateSnapshotAsync(beforeJoin.Index, beforeJoin.Data, ct);
+        await leader.CompactAsync(beforeJoin.Index, ct);
+
+        await leader.ChangeConfigurationAsync(ConfChangeV2.Single(ConfChangeType.AddLearnerNode, 2), ct);
+        ConfState committedMembership;
+        do
+        {
+            committedMembership = await leader.CommittedConfigurations.ReadAsync(ct);
+        }
+        while (!committedMembership.Learners.Contains(2UL));
+
+        var learnerStorage = new MemoryStorage();
+        learnerStorage.SetConfState(initial, beforeJoin.Index);
+        await using var learner = new RaftNode(
+            new RaftConfig { Id = 2 }, learnerStorage, network.CreateNode(2));
+        await learner.StartAsync(ct);
+
+        CommittedItem installed = await learner.CommittedItems.ReadAsync(ct);
+        await Assert.That(installed.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+        await Assert.That(installed.Index).IsEqualTo(beforeJoin.Index);
+        await Assert.That(learnerStorage.LatestSnapshot()?.Metadata.ConfState.Equals(initial) ?? false).IsTrue();
+
+        await leader.ProposeAsync(new byte[] { 2 }, ct);
+        CommittedItem afterJoin = await learner.CommittedItems.ReadAsync(ct);
+        await Assert.That(afterJoin.Data.Span.SequenceEqual(new byte[] { 2 })).IsTrue();
+        await Assert.That(learnerStorage.InitialState().ConfState.Equals(committedMembership)).IsTrue();
+    }
+
+    [Test]
+    public async Task PeerSnapshotAdmissionDoesNotStopTheDriver()
+    {
+        await using var network = new InMemoryNetwork();
+        ConfState membership = new(new ulong[] { 1, 2 });
+        var storage = new MemoryStorage(membership);
+        int validations = 0;
+        await using var node = new RaftNode(
+            new RaftConfig { Id = 2 },
+            storage,
+            network.CreateNode(2),
+            new RaftNodeOptions
+            {
+                TickInterval = TimeSpan.FromHours(1),
+                MaxIncomingMessageBytes = 128,
+                SnapshotValidator = snapshot =>
+                {
+                    Interlocked.Increment(ref validations);
+                    return snapshot.Data.Span.SequenceEqual(new byte[] { 1 })
+                        ? true
+                        : throw new InvalidDataException("Unrecognized snapshot format.");
+                },
+            });
+        await using IRaftTransport peer = network.CreateNode(1);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await peer.StartAsync(timeout.Token);
+        await node.StartAsync(timeout.Token);
+
+        await sendSnapshot(1, 1, new byte[32]);
+        await sendSnapshot(2, 1, new byte[] { 2 });
+        await sendSnapshot(3, 2, new byte[] { 1 });
+        await sendSnapshot(4, 1, new byte[] { 1 });
+
+        CommittedItem installed = await node.CommittedItems.ReadAsync(timeout.Token);
+        await Assert.That(installed.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+        await Assert.That(installed.Index).IsEqualTo(4UL);
+        await Assert.That(storage.LatestSnapshot()?.Metadata.Index).IsEqualTo((ulong?)4);
+        await Assert.That(Volatile.Read(ref validations)).IsEqualTo(2);
+
+        async ValueTask sendSnapshot(ulong index, ulong term, ReadOnlyMemory<byte> data)
+        {
+            var message = new Message
+            {
+                Type = MessageType.Snapshot,
+                From = 1,
+                To = 2,
+                Term = 1,
+                Snapshot = new Snapshot(new SnapshotMetadata(index, term, membership), data),
+            };
+            byte[] frame = new byte[MessageCodec.EncodedLength(message)];
+            _ = MessageCodec.TryWrite(message, frame);
+            await peer.SendAsync(2, frame, timeout.Token);
+        }
+    }
+
+    [Test]
+    public async Task RestartRejectsSnapshotWithADifferentTermFromTheStoredLog()
+    {
+        await using var network = new InMemoryNetwork();
+        await using IRaftTransport transport = network.CreateNode(1);
+        var membership = new ConfState(new ulong[] { 1 });
+        var storage = new MemoryStorage(membership);
+        storage.Append(new[] { new Entry(EntryType.Normal, 1, 1, default) });
+        storage.CreateSnapshot(1, membership, default);
+        storage.Append(new[] { new Entry(EntryType.Normal, 2, 1, default) });
+
+        await Assert.That(() => new RaftNode(new RaftConfig { Id = 1 }, storage, transport))
+            .Throws<InvalidOperationException>();
+    }
+
+    [Test]
+    public async Task RestartRejectsSnapshotWithUnrecognizedApplicationData()
+    {
+        await using var network = new InMemoryNetwork();
+        await using IRaftTransport transport = network.CreateNode(1);
+        var membership = new ConfState(new ulong[] { 1 });
+        var storage = new MemoryStorage(membership);
+        storage.Append(new[] { new Entry(EntryType.Normal, 1, 1, default) });
+        storage.CreateSnapshot(1, membership, default);
+
+        var options = new RaftNodeOptions { SnapshotValidator = snapshot => !snapshot.Data.IsEmpty };
+        await Assert.That(() => new RaftNode(new RaftConfig { Id = 1 }, storage, transport, options))
+            .Throws<InvalidOperationException>();
+    }
+
+    [Test]
+    public async Task CreateSnapshotRejectsUnrecognizedApplicationDataBeforeStorage()
+    {
+        await using var network = new InMemoryNetwork();
+        var storage = new MemoryStorage(new ConfState(new ulong[] { 1 }));
+        await using var node = new RaftNode(
+            new RaftConfig { Id = 1, RandomizedElectionTimeout = 5 },
+            storage,
+            network.CreateNode(1),
+            new RaftNodeOptions { SnapshotValidator = snapshot => !snapshot.Data.IsEmpty });
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await StartLeaderAsync(node, timeout.Token);
+        await node.ProposeAsync(new byte[] { 1 }, timeout.Token);
+        CommittedItem command = await node.CommittedItems.ReadAsync(timeout.Token);
+
+        await Assert.That(async () => await node.CreateSnapshotAsync(command.Index, default, timeout.Token))
+            .Throws<InvalidOperationException>();
+        await Assert.That(storage.LatestSnapshot()).IsNull();
+    }
+
     [Test]
     public async Task CreateSnapshotAsync_StoresTheApplicationStateAtTheIndex()
     {

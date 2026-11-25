@@ -39,6 +39,9 @@ public readonly struct ConfChangeSingle
 /// <summary>A batch of membership changes applied atomically, optionally via joint consensus.</summary>
 public sealed class ConfChangeV2
 {
+    private const int HeaderSize = 2;
+    private const int ChangeSize = 1 + sizeof(ulong);
+
     /// <summary>Initializes a new instance of the <see cref="ConfChangeV2"/> class.</summary>
     /// <param name="changes">The atomic changes.</param>
     /// <param name="useJoint">Whether to transition through the joint configuration.</param>
@@ -77,10 +80,11 @@ public sealed class ConfChangeV2
     /// <returns>The encoded bytes.</returns>
     public byte[] Encode()
     {
-        var buffer = new byte[2 + (Changes.Count * 9)];
+        byte count = checked((byte)Changes.Count);
+        var buffer = new byte[HeaderSize + (count * ChangeSize)];
         buffer[0] = (byte)((UseJoint ? 1 : 0) | (AutoLeave ? 2 : 0));
-        buffer[1] = checked((byte)Changes.Count);
-        int offset = 2;
+        buffer[1] = count;
+        int offset = HeaderSize;
         for (int i = 0; i < Changes.Count; i++)
         {
             buffer[offset++] = (byte)Changes[i].Type;
@@ -94,17 +98,23 @@ public sealed class ConfChangeV2
     /// <summary>Decodes a change from a log entry payload.</summary>
     /// <param name="data">The encoded bytes.</param>
     /// <returns>The decoded change.</returns>
+    /// <exception cref="FormatException">The payload has a header but is not a valid configuration change.</exception>
     public static ConfChangeV2 Decode(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 2)
+        if (data.Length < HeaderSize)
         {
             return new ConfChangeV2(Array.Empty<ConfChangeSingle>());
+        }
+
+        if (!IsValidEncoding(data))
+        {
+            throw new FormatException("Invalid configuration change payload.");
         }
 
         byte flags = data[0];
         int count = data[1];
         var changes = new ConfChangeSingle[count];
-        int offset = 2;
+        int offset = HeaderSize;
         for (int i = 0; i < count; i++)
         {
             var type = (ConfChangeType)data[offset++];
@@ -114,5 +124,26 @@ public sealed class ConfChangeV2
         }
 
         return new ConfChangeV2(changes, (flags & 1) != 0, (flags & 2) != 0);
+    }
+
+    internal static bool IsValidEncoding(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < HeaderSize
+            || data.Length != HeaderSize + (data[1] * ChangeSize)
+            || data[0] > 3)
+        {
+            return false;
+        }
+
+        for (int offset = HeaderSize; offset < data.Length; offset += ChangeSize)
+        {
+            if (data[offset] > (byte)ConfChangeType.RemoveNode
+                || BinaryPrimitives.ReadUInt64BigEndian(data.Slice(offset + 1)) == 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 }

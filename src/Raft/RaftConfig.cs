@@ -27,6 +27,12 @@ public sealed class RaftConfig
     public int MaxInflightMessages { get; set; } = 256;
 
     /// <summary>
+    /// Gets or sets the maximum number of distinct members in a snapshot or a proposed configuration (default 1024).
+    /// Configure the same limit on all replicas, including nodes bootstrapping from a snapshot.
+    /// </summary>
+    public int MaxClusterMembers { get; set; } = 1024;
+
+    /// <summary>
     /// Gets or sets the per-peer in-flight append window capacity in payload bytes. The default
     /// (<see cref="ulong.MaxValue"/>) leaves the byte window unbounded, so only
     /// <see cref="MaxInflightMessages"/> throttles replication (raft-rs parity).
@@ -72,6 +78,11 @@ public sealed class RaftConfig
         if (MaxInflightMessages <= 0)
         {
             throw new ArgumentException("MaxInflightMessages must be positive.", nameof(MaxInflightMessages));
+        }
+
+        if (MaxClusterMembers <= 0)
+        {
+            throw new ArgumentException("MaxClusterMembers must be positive.", nameof(MaxClusterMembers));
         }
 
         if (MaxInflightBytes == 0)

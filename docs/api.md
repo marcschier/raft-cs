@@ -71,6 +71,7 @@ Apply committed conf-change entries by computing the new `ConfState` (via `Chang
 | --- | --- |
 | `IRaftTransport` | `StartAsync`, `SendAsync(recipient, frame)`, `FrameReceived`. |
 | `InMemoryNetwork` / `InMemoryTransport` | In-process bus with loss/partition injection (package `RaftCs.Transport`). |
+| `TlsRaftTransport` / `TlsRaftPeer` / `TlsRaftTransportOptions` | Bounded TCP transport with mutual TLS and certificate-pinned member identities (package `RaftCs.Transport`). |
 | `NanoMsgBusTransport` / `NanoMsgBusTransportOptions` | NNG/nanomsg BUS transport (package `RaftCs.Transport.NanoMsg`). |
 
 ## Membership

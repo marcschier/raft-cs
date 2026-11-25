@@ -109,17 +109,31 @@ jobs:
             9.0.x
             10.0.x
 
-      - name: Test with coverage
+      - name: Test core with coverage
         run: >
           dotnet test --project tests/Raft.Tests/Raft.Tests.csproj -c Release -f net10.0
           --results-directory artifacts/coverage
-          --coverage --coverage-output-format cobertura --coverage-output coverage.cobertura.xml
+          --coverage --coverage-output-format cobertura --coverage-output core.cobertura.xml
+
+      - name: Test transports with coverage
+        run: >
+          dotnet test --project tests/Raft.Transport.Tests/Raft.Transport.Tests.csproj -c Release -f net10.0
+          --results-directory artifacts/coverage
+          --coverage --coverage-output-format cobertura --coverage-output transport.cobertura.xml
+
+      - name: Merge coverage from both suites
+        run: |
+          dotnet tool install dotnet-reportgenerator-globaltool --version 5.5.11 --tool-path "$RUNNER_TEMP/reportgenerator"
+          "$RUNNER_TEMP/reportgenerator/reportgenerator" \
+            "-reports:artifacts/coverage/*.cobertura.xml" \
+            "-targetdir:artifacts/coverage/merged" \
+            "-reporttypes:Cobertura"
 
       - name: Enforce coverage threshold (>= 85% lines)
         shell: pwsh
         run: >
           ./eng/check-coverage.ps1
-          -CoverageFile artifacts/coverage/coverage.cobertura.xml
+          -CoverageFile artifacts/coverage/merged/Cobertura.xml
           -MinLineRate 0.85
 
   interop:

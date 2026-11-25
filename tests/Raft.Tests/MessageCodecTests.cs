@@ -23,7 +23,7 @@ public sealed class MessageCodecTests
             Entries = new[]
             {
                 new Entry(EntryType.Normal, 9, 43, new byte[] { 1, 2, 3 }),
-                new Entry(EntryType.ConfChangeV2, 9, 44, new byte[] { 9, 8 }),
+                new Entry(EntryType.ConfChangeV2, 9, 44, ConfChangeV2.Single(ConfChangeType.AddNode, 8).Encode()),
             },
         };
 
@@ -122,6 +122,18 @@ public sealed class MessageCodecTests
 
         // Chop the trailing ConfState so the snapshot decode must fail.
         await Assert.That(MessageCodec.TryParse(buffer.AsSpan(0, buffer.Length - 3), out _)).IsFalse();
+    }
+
+    [Test]
+    public async Task TryParse_RequiresAnExactMessageLength()
+    {
+        var message = new Message { Type = MessageType.Heartbeat, From = 1, To = 2, Term = 1 };
+        int length = MessageCodec.EncodedLength(message);
+        var buffer = new byte[length + 1];
+        await Assert.That(MessageCodec.TryWrite(message, buffer)).IsTrue();
+        await Assert.That(MessageCodec.TryParse(buffer.AsSpan(0, length), out _)).IsTrue();
+        await Assert.That(MessageCodec.TryParse(buffer, out Message? trailing)).IsFalse();
+        await Assert.That(trailing).IsNull();
     }
 
     [Test]
