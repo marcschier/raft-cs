@@ -1,5 +1,6 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
@@ -13,6 +14,42 @@ namespace Raft.Transport.Tests;
 
 public sealed class TlsRaftTransportTests
 {
+    [Test]
+    public async Task PendingTlsDataDoesNotInterruptOrderedSends()
+    {
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using X509Certificate2 first = CreateCertificate();
+        using X509Certificate2 second = CreateCertificate();
+        using var listener = new TcpListener(Loopback());
+        listener.Start();
+        await using var source = new TlsRaftTransport(1, Loopback(), first,
+            [new(2, (IPEndPoint)listener.LocalEndpoint, second)]);
+        await source.StartAsync(limit.Token);
+        byte[] outbound = Heartbeat(1, 2, 1);
+        await source.SendAsync(2, outbound, limit.Token);
+
+        using TcpClient socket = await listener.AcceptTcpClientAsync(limit.Token);
+        using var stream = new SslStream(socket.GetStream(), false, (_, remote, _, _) => IsCertificate(first, remote));
+        await stream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+        {
+            ServerCertificate = second,
+            ClientCertificateRequired = true,
+            EnabledSslProtocols = SslProtocols.Tls12,
+        }, limit.Token);
+        await Assert.That(await ReadFrameAsync(stream, limit.Token)).IsEquivalentTo(outbound);
+
+        // Leave an encrypted record pending on the sender, as TLS post-handshake records can be.
+        await stream.WriteAsync(new byte[] { 42 }, limit.Token);
+        byte[] next = Heartbeat(1, 2, 2);
+        byte[] last = Heartbeat(1, 2, 3);
+        await source.SendAsync(2, next, limit.Token);
+        await source.SendAsync(2, last, limit.Token);
+
+        await Assert.That(await ReadFrameAsync(stream, limit.Token)).IsEquivalentTo(next);
+        await Assert.That(await ReadFrameAsync(stream, limit.Token)).IsEquivalentTo(last);
+        await Assert.That(listener.Pending()).IsFalse();
+    }
+
     [Test]
     public async Task ConfiguredMembersExchangeFramesInOrder()
     {
@@ -362,6 +399,15 @@ public sealed class TlsRaftTransportTests
         byte[] framed = new byte[FrameCodec.FrameLength(payload.Length)];
         FrameCodec.TryWriteFrame(payload, framed);
         await stream.WriteAsync(framed, cancellationToken);
+    }
+
+    private static async Task<byte[]> ReadFrameAsync(SslStream stream, CancellationToken cancellationToken)
+    {
+        byte[] prefix = new byte[sizeof(int)];
+        await stream.ReadExactlyAsync(prefix, cancellationToken);
+        byte[] payload = new byte[BinaryPrimitives.ReadInt32BigEndian(prefix)];
+        await stream.ReadExactlyAsync(payload, cancellationToken);
+        return payload;
     }
 
     private static byte[] Heartbeat(ulong from, ulong to, ulong term = 1) =>

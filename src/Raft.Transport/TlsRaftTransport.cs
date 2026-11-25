@@ -436,7 +436,7 @@ public sealed class TlsRaftTransport : IRaftTransport
                 try
                 {
                     stop.ThrowIfCancellationRequested();
-                    if (connection is not null && connection.HasPendingRead)
+                    if (connection is not null && connection.IsClosed)
                     {
                         connection.Dispose();
                         connection = null;
@@ -648,7 +648,8 @@ public sealed class TlsRaftTransport : IRaftTransport
 
         public Peer Peer { get; } = peer;
 
-        public bool HasPendingRead => _socket.Poll(0, SelectMode.SelectRead);
+        // Readability also signals pending TLS records, not just a closed connection.
+        public bool IsClosed => _socket.Poll(0, SelectMode.SelectRead) && _socket.Available == 0;
 
         public void Dispose()
         {
