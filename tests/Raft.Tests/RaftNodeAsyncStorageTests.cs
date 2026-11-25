@@ -2,6 +2,7 @@
 
 using System.Text;
 using Raft.Configuration;
+using Raft.Messages;
 using Raft.Storage;
 using Raft.Transport;
 
@@ -9,6 +10,67 @@ namespace Raft.Tests;
 
 public sealed class RaftNodeAsyncStorageTests
 {
+    [Test]
+    [Arguments(true)]
+    [Arguments(false)]
+    public async Task SuccessorSnapshotCannotSkipACommittedMembershipChange(bool entryAlreadyDurable)
+    {
+        var initial = new ConfState(new ulong[] { 1, 2, 3 });
+        ConfChangeV2 remove = ConfChangeV2.Single(ConfChangeType.RemoveNode, 1);
+        ConfState current = Changer.Apply(initial, remove);
+        var storage = new MemoryStorage(initial);
+        Entry[] removal = { new(EntryType.ConfChangeV2, 1, 1, remove.Encode()) };
+        if (entryAlreadyDurable)
+        {
+            storage.Append(removal);
+        }
+
+        var commit = new Message
+        {
+            Type = entryAlreadyDurable ? MessageType.Heartbeat : MessageType.Append,
+            From = 1,
+            To = 3,
+            Term = 1,
+            Commit = 1,
+            Entries = entryAlreadyDurable ? Array.Empty<Entry>() : removal,
+        };
+        var snapshot = new Message
+        {
+            Type = MessageType.Snapshot,
+            From = 2,
+            To = 3,
+            Term = 2,
+            Snapshot = new Snapshot(new SnapshotMetadata(2, 2, current), new byte[] { 1 }),
+        };
+        var transport = new BufferedStartTransport(commit, snapshot);
+        var membershipAtValidation = new TaskCompletionSource<ulong?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var node = new RaftNode(
+            new RaftConfig { Id = 3 },
+            storage,
+            transport,
+            new RaftNodeOptions
+            {
+                TickInterval = TimeSpan.FromHours(1),
+                SnapshotValidator = _ =>
+                {
+                    membershipAtValidation.TrySetResult(storage.ConfStateIndex());
+                    return true;
+                },
+            });
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        CancellationToken ct = timeout.Token;
+        await node.StartAsync(ct);
+
+        await Assert.That(await node.CommittedConfigurations.ReadAsync(ct)).IsEqualTo(initial);
+        await Assert.That(await node.CommittedConfigurations.ReadAsync(ct)).IsEqualTo(current);
+
+        CommittedItem installed = await node.CommittedItems.ReadAsync(ct);
+        await Assert.That(installed.Kind).IsEqualTo(CommittedItemKind.Snapshot);
+        await Assert.That(installed.Index).IsEqualTo(2UL);
+        await Assert.That(await membershipAtValidation.Task.WaitAsync(ct)).IsEqualTo((ulong?)1);
+    }
+
     [Test]
     public async Task FollowerForwardsProposalToLeaderOverTransport()
     {
@@ -93,5 +155,34 @@ public sealed class RaftNodeAsyncStorageTests
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         ReadOnlyMemory<byte> command = await node.Committed.ReadAsync(timeout.Token);
         return Encoding.UTF8.GetString(command.ToArray());
+    }
+
+    private sealed class BufferedStartTransport(params Message[] initial) : IRaftTransport
+    {
+        public event Action<ReadOnlyMemory<byte>>? FrameReceived;
+
+        public ValueTask StartAsync(CancellationToken cancellationToken = default)
+        {
+            // StartAsync queues both messages before Raft starts reading the inbox.
+            foreach (Message message in initial)
+            {
+                Deliver(message);
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask SendAsync(
+            ulong recipient, ReadOnlyMemory<byte> frame, CancellationToken cancellationToken = default) =>
+            ValueTask.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private void Deliver(Message message)
+        {
+            var frame = new byte[MessageCodec.EncodedLength(message)];
+            _ = MessageCodec.TryWrite(message, frame);
+            FrameReceived?.Invoke(frame);
+        }
     }
 }

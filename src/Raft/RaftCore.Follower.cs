@@ -62,9 +62,8 @@ public sealed partial class RaftCore
 
     private void ForwardProposalToLeader(Message message)
     {
-        if (LeaderId == None || _disableProposalForwarding)
+        if (_disableProposalForwarding || !_tracker.IsVoter(LeaderId))
         {
-            // No known leader to forward to, or forwarding disabled: drop the proposal.
             return;
         }
 

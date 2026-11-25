@@ -1,5 +1,6 @@
 // Copyright (c) marcschier. Licensed under the MIT License.
 
+using Raft.Configuration;
 using Raft.Messages;
 using Raft.Progress;
 using Raft.Storage;
@@ -15,6 +16,11 @@ public sealed partial class RaftCore
     internal bool AppendEntries(IReadOnlyList<Entry> entries)
     {
         ulong lastIndex = _log.LastIndex();
+        if ((ulong)entries.Count > MaxLogIndex - lastIndex)
+        {
+            return false;
+        }
+
         var stamped = new Entry[entries.Count];
         for (int i = 0; i < entries.Count; i++)
         {
@@ -65,7 +71,8 @@ public sealed partial class RaftCore
     private bool IncreaseUncommittedSize(IReadOnlyList<Entry> entries)
     {
         ulong size = PayloadsSize(entries);
-        if (_uncommittedSize > 0 && size > 0 && _uncommittedSize + size > _maxUncommittedSize)
+        if (_uncommittedSize > 0 && size > 0
+            && (size > _maxUncommittedSize || _uncommittedSize > _maxUncommittedSize - size))
         {
             return false;
         }
@@ -118,20 +125,33 @@ public sealed partial class RaftCore
             return;
         }
 
+        ulong lastIndex = _log.LastIndex();
+        if ((ulong)message.Entries.Count > MaxLogIndex - lastIndex)
+        {
+            return;
+        }
+
         var toAppend = new List<Entry>(message.Entries.Count);
+        ulong pendingConfIndex = PendingConfIndex;
         foreach (Entry entry in message.Entries)
         {
             Entry candidate = entry;
             if (entry.Type is EntryType.ConfChange or EntryType.ConfChangeV2)
             {
-                if (PendingConfIndex > _log.Applied)
+                if (pendingConfIndex > _log.Applied)
                 {
                     // A configuration change is already in flight; drop this one to preserve safety.
                     candidate = new Entry(EntryType.Normal, 0, 0, ReadOnlyMemory<byte>.Empty);
                 }
                 else
                 {
-                    PendingConfIndex = _log.LastIndex() + (ulong)toAppend.Count + 1;
+                    ConfState next = Changer.Apply(_tracker.ToConfState(), ConfChangeV2.Decode(entry.Data.Span));
+                    if (!IsValidConfiguration(next))
+                    {
+                        return;
+                    }
+
+                    pendingConfIndex = lastIndex + (ulong)toAppend.Count + 1;
                 }
             }
 
@@ -140,6 +160,7 @@ public sealed partial class RaftCore
 
         if (AppendEntries(toAppend))
         {
+            PendingConfIndex = pendingConfIndex;
             BcastAppend();
         }
     }
@@ -258,8 +279,9 @@ public sealed partial class RaftCore
             return;
         }
 
-        if (snapshot.IsEmpty)
+        if (snapshot.IsEmpty || !SnapshotContainsVoter(snapshot, Id))
         {
+            // Do not park replication in snapshot state; a heartbeat response can retry after a newer snapshot.
             return;
         }
 

@@ -21,6 +21,7 @@ public sealed class RaftNode : IAsyncDisposable
     private readonly Raft.Transport.IRaftTransport _transport;
     private readonly Raft.Transport.IRaftBatchTransport? _batchTransport;
     private readonly RaftNodeOptions _options;
+    private readonly int _maxIncomingMessageBytes;
     private readonly TimeProvider _timeProvider;
     private readonly Channel<object> _inbox;
     private readonly CommittedQueue _committed = new();
@@ -43,9 +44,11 @@ public sealed class RaftNode : IAsyncDisposable
     // holds until the applied index reaches it: the stored commit index can lag behind the stored membership, so
     // entries up to it may still be applied after construction.
     private ulong _replayConfigurationChangesAfter;
+    private ulong _configurationCheckedThrough;
+    private ulong _pendingConfigurationIndex;
     private volatile ConfState _publishedConfState;
     private Task? _loop;
-    private Task? _appendTask;
+    private Task<AppendComplete?>? _appendTask;
     private ITimer? _tickTimer;
     private bool _started;
     private bool _disposed;
@@ -82,8 +85,14 @@ public sealed class RaftNode : IAsyncDisposable
         _transport = transport;
         _batchTransport = transport as Raft.Transport.IRaftBatchTransport;
         _options = options ?? new RaftNodeOptions();
+        _maxIncomingMessageBytes = _options.MaxIncomingMessageBytes;
+        if (_maxIncomingMessageBytes <= 0)
+        {
+            throw new ArgumentException("MaxIncomingMessageBytes must be positive.", nameof(options));
+        }
+
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _core = new RaftCore(config, storage);
+        _core = new RaftCore(config, storage, _options.SnapshotValidator);
         _confState = storage.InitialState().ConfState;
         Snapshot? restored = RestoreLatestSnapshot();
         _appliedIndex = (long)_core.Applied;
@@ -235,7 +244,10 @@ public sealed class RaftNode : IAsyncDisposable
         return _inbox.Writer.WriteAsync(message, cancellationToken);
     }
 
-    /// <summary>Proposes a cluster membership change.</summary>
+    /// <summary>
+    /// Proposes a cluster membership change on the local leader. A follower does not forward the request.
+    /// </summary>
+    /// <remarks>Expose this API only through an application-authorized administrative path.</remarks>
     /// <param name="change">The configuration change.</param>
     /// <param name="cancellationToken">A token that cancels the enqueue.</param>
     /// <returns>A value task that completes when the change is accepted into the driver.</returns>
@@ -406,7 +418,9 @@ public sealed class RaftNode : IAsyncDisposable
 
     private void OnFrameReceived(ReadOnlyMemory<byte> frame)
     {
-        if (MessageCodec.TryParse(frame.Span, out Message? message) && message is not null && message.To == _core.Id)
+        if (frame.Length <= _maxIncomingMessageBytes
+            && MessageCodec.TryParse(frame.Span, out Message? message)
+            && message is not null && message.To == _core.Id)
         {
             _inbox.Writer.TryWrite(message);
         }
@@ -431,7 +445,14 @@ public sealed class RaftNode : IAsyncDisposable
                     }
                     else if (item is Message message)
                     {
-                        _core.Step(message);
+                        if (message.To == 0 || PrepareForPeerMessage())
+                        {
+                            _core.Step(message);
+                        }
+                        else
+                        {
+                            await StepAfterPendingConfigurationAsync(message, cancellationToken).ConfigureAwait(false);
+                        }
                     }
                     else if (item is AppendComplete complete)
                     {
@@ -462,6 +483,65 @@ public sealed class RaftNode : IAsyncDisposable
         {
             FailPendingRequests();
         }
+    }
+
+    private async Task StepAfterPendingConfigurationAsync(Message message, CancellationToken cancellationToken)
+    {
+        do
+        {
+            await ProcessReadyAsync(cancellationToken).ConfigureAwait(false);
+            if (_appendTask is not { } pending
+                || await pending.ConfigureAwait(false) is not { } complete
+                || cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            // Observe completion directly so this frame stays ahead of later inbox work.
+            await OnAppendCompleteAsync(complete, cancellationToken).ConfigureAwait(false);
+        }
+        while (!PrepareForPeerMessage());
+
+        _core.Step(message);
+    }
+
+    private bool PrepareForPeerMessage()
+    {
+        while (_core.Applied < Math.Min(_core.CommitIndex, _core.Log.StableIndex) && ApplyCommitted())
+        {
+            // Apply all durable configuration entries before the next peer is authorized.
+        }
+
+        ulong applied = Math.Max(_core.Applied, _replayConfigurationChangesAfter);
+        if (_pendingConfigurationIndex > applied)
+        {
+            return false;
+        }
+
+        ulong committed = _core.CommitIndex;
+        ulong checkedThrough = Math.Max(applied, _configurationCheckedThrough);
+        if (checkedThrough >= committed)
+        {
+            return true;
+        }
+
+        // After draining the durable prefix, only the unstable tail can still contain committed changes.
+        // Remember the scanned prefix so normal entries are not rescanned for each received message.
+        IReadOnlyList<Entry> unstable = _core.UnstableEntries();
+        ulong first = unstable[0].Index;
+        for (ulong index = Math.Max(first, checkedThrough + 1); index <= committed; index++)
+        {
+            Entry entry = unstable[checked((int)(index - first))];
+            if (entry.Type is EntryType.ConfChange or EntryType.ConfChangeV2)
+            {
+                _configurationCheckedThrough = index;
+                _pendingConfigurationIndex = index;
+                return false;
+            }
+        }
+
+        _configurationCheckedThrough = committed;
+        return true;
     }
 
     /// <summary>
@@ -521,6 +601,12 @@ public sealed class RaftNode : IAsyncDisposable
 
     private async Task OnAppendCompleteAsync(AppendComplete complete, CancellationToken cancellationToken)
     {
+        if (complete.Handled)
+        {
+            return;
+        }
+
+        complete.Handled = true;
         _appendInFlight = false;
         StorageWrite write = complete.Write;
 
@@ -540,7 +626,7 @@ public sealed class RaftNode : IAsyncDisposable
         _core.AckStorageWrite(write);
     }
 
-    private void RunStorageWrite(StorageWrite write)
+    private AppendComplete? RunStorageWrite(StorageWrite write)
     {
         try
         {
@@ -553,10 +639,12 @@ public sealed class RaftNode : IAsyncDisposable
             _stopFault = ex;
             _committed.Complete(ex);
             _stop.Cancel();
-            return;
+            return null;
         }
 
-        _inbox.Writer.TryWrite(new AppendComplete(write));
+        var complete = new AppendComplete(write);
+        _inbox.Writer.TryWrite(complete);
+        return complete;
     }
 
     /// <summary>
@@ -647,8 +735,15 @@ public sealed class RaftNode : IAsyncDisposable
     {
         try
         {
-            Snapshot snapshot = _snapshotStorage!.CreateSnapshot(
-                request.Index, ConfStateAt(request.Index), request.Data);
+            ConfState configuration = ConfStateAt(request.Index);
+            var metadata = new SnapshotMetadata(request.Index, _storage.Term(request.Index), configuration);
+            if (!_core.HasValidSnapshotMetadata(metadata)
+                || !_core.AcceptsSnapshotData(new Snapshot(metadata, request.Data)))
+            {
+                throw new InvalidOperationException("The application snapshot is invalid.");
+            }
+
+            Snapshot snapshot = _snapshotStorage!.CreateSnapshot(request.Index, configuration, request.Data);
 
             // Only the configuration in force at the snapshot and the ones committed after it are still needed.
             int keepFrom = _confHistory.FindLastIndex(pair => pair.Key <= request.Index);
@@ -702,6 +797,18 @@ public sealed class RaftNode : IAsyncDisposable
                 $"The log is compacted to index {compacted}, past the latest snapshot at index "
                 + $"{snapshot.Metadata.Index}: the entries between them are in neither, so the application state "
                 + "cannot be restored.");
+        }
+
+        if (!_core.HasValidSnapshotMetadata(snapshot.Metadata)
+            || snapshot.Metadata.Index > _storage.LastIndex()
+            || _storage.Term(snapshot.Metadata.Index) != snapshot.Metadata.Term)
+        {
+            throw new InvalidOperationException("The latest snapshot does not match the stored log position.");
+        }
+
+        if (!_core.AcceptsSnapshotData(snapshot))
+        {
+            throw new InvalidOperationException("The application rejected the latest stored snapshot.");
         }
 
         _core.RestoreAppliedTo(snapshot.Metadata.Index);
@@ -899,7 +1006,16 @@ public sealed class RaftNode : IAsyncDisposable
             return false;
         }
 
-        int length = MessageCodec.EncodedLength(message);
+        int length;
+        try
+        {
+            length = MessageCodec.EncodedLength(message);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+
         byte[] bytes = new byte[length];
         if (!MessageCodec.TryWrite(message, bytes))
         {
@@ -952,6 +1068,8 @@ public sealed class RaftNode : IAsyncDisposable
         internal AppendComplete(StorageWrite write) => Write = write;
 
         internal StorageWrite Write { get; }
+
+        internal bool Handled { get; set; }
     }
 
     private Task<TResult> EnqueueRequest<TResult>(LoopRequest<TResult> request, CancellationToken cancellationToken)

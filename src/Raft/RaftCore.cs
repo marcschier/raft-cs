@@ -26,6 +26,9 @@ public sealed partial class RaftCore
     private readonly ulong _maxSizePerMessage;
     private readonly ulong _maxUncommittedSize;
     private readonly bool _disableProposalForwarding;
+    private readonly int _maxClusterMembers;
+    private readonly Func<Snapshot, bool>? _snapshotValidator;
+    private readonly ulong _recoveredConfigurationIndex;
     private ulong _uncommittedSize;
 
     private int _electionElapsed;
@@ -38,6 +41,18 @@ public sealed partial class RaftCore
     /// <param name="config">The node configuration.</param>
     /// <param name="storage">The durable backing store.</param>
     public RaftCore(RaftConfig config, IRaftStorage storage)
+        : this(config, storage, snapshotValidator: null)
+    {
+    }
+
+    /// <summary>Initializes a new instance of the <see cref="RaftCore"/> class.</summary>
+    /// <param name="config">The node configuration.</param>
+    /// <param name="storage">The durable backing store.</param>
+    /// <param name="snapshotValidator">
+    /// Optional synchronous, side-effect-free check of application data before installing a peer snapshot. Return
+    /// <see langword="false"/> to reject it; exceptions other than resource exhaustion also reject it.
+    /// </param>
+    public RaftCore(RaftConfig config, IRaftStorage storage, Func<Snapshot, bool>? snapshotValidator)
     {
         Internal.Check.NotNull(config);
         Internal.Check.NotNull(storage);
@@ -51,11 +66,14 @@ public sealed partial class RaftCore
         _maxSizePerMessage = config.MaxSizePerMessage;
         _maxUncommittedSize = config.MaxUncommittedEntriesSize;
         _disableProposalForwarding = config.DisableProposalForwarding;
+        _maxClusterMembers = config.MaxClusterMembers;
+        _snapshotValidator = snapshotValidator;
         _rng = new Random(unchecked((int)(config.Id * 2654435761u)));
         _log = new RaftLog(storage);
         _tracker = new ProgressTracker(config.MaxInflightMessages, config.MaxInflightBytes);
 
         (HardState hardState, ConfState confState) = storage.InitialState();
+        _recoveredConfigurationIndex = (storage as IRaftConfStateIndexStorage)?.ConfStateIndex() ?? None;
         _tracker.ApplyConf(confState, 1);
 
         Term = hardState.Term;
@@ -296,24 +314,36 @@ public sealed partial class RaftCore
         }
     }
 
-    /// <summary>Feeds one message into the state machine.</summary>
+    /// <summary>
+    /// Feeds one message into the state machine. Local signals have no recipient; transports must authenticate
+    /// peer sender ids and deliver only messages addressed to this node. Only a voter in the locally committed
+    /// configuration (incoming or outgoing) can send leader traffic. Forwarded proposals carry normal entries only.
+    /// </summary>
+    /// <remarks>
+    /// Seed a fresh learner's store with trusted committed voter membership before starting it. Record the
+    /// configuration's index with <see cref="IRaftConfStateIndexStorage"/> when the store supports it. If a replica
+    /// does not know the current leader as a voter and cannot catch up from a known voter, it needs a trusted reseed.
+    /// A snapshot used for installation must capture the sender as a voter and must not precede the seeded
+    /// configuration. It may predate the learner's addition.
+    /// </remarks>
     /// <param name="message">The message to process.</param>
     public void Step(Message message)
     {
         Internal.Check.NotNull(message);
 
-        if (message.Term == 0)
+        if (message.To == None ? !AcceptLocalMessage(message) : !AcceptPeerMessage(message))
         {
-            // Local signal.
+            return;
         }
-        else if (message.Term > Term)
+
+        if (message.Term > Term)
         {
             if (!StepHigherTerm(message))
             {
                 return;
             }
         }
-        else if (message.Term < Term)
+        else if (message.Term != None && message.Term < Term)
         {
             StepLowerTerm(message);
             return;
@@ -449,6 +479,11 @@ public sealed partial class RaftCore
 
     private void Campaign(CampaignType campaignType)
     {
+        if (Term >= MaxTerm)
+        {
+            return;
+        }
+
         ulong term;
         MessageType voteType;
         if (campaignType == CampaignType.PreElection)
@@ -530,8 +565,11 @@ public sealed partial class RaftCore
         _uncommittedSize = 0;
 
         PendingConfIndex = _log.LastIndex();
-        var noop = new Entry(EntryType.Normal, Term, _log.LastIndex() + 1, ReadOnlyMemory<byte>.Empty);
-        AppendEntries(new[] { noop });
+        if (PendingConfIndex < MaxLogIndex)
+        {
+            var noop = new Entry(EntryType.Normal, Term, PendingConfIndex + 1, ReadOnlyMemory<byte>.Empty);
+            AppendEntries(new[] { noop });
+        }
     }
 
     private void Reset(ulong term)
@@ -639,6 +677,11 @@ public sealed partial class RaftCore
         if (message.From == None)
         {
             message.From = Id;
+        }
+
+        if (message.Term == None && message.Type != MessageType.Propose)
+        {
+            message.Term = Term;
         }
 
         // Responses that reflect newly durable state (a follower acknowledging appended entries, or a node granting a

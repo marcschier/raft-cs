@@ -80,7 +80,10 @@ internal sealed class RaftLog
 
     internal ulong LastTerm() => Term(LastIndex());
 
-    internal bool MatchTerm(ulong index, ulong term) => Term(index) == term;
+    internal bool MatchTerm(ulong index, ulong term)
+    {
+        return (term != 0 || (index == 0 && FirstIndex() == 1)) && Term(index) == term;
+    }
 
     internal bool IsUpToDate(ulong lastIndex, ulong term)
     {

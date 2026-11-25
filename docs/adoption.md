@@ -76,7 +76,26 @@ Everything funnels through one driver loop, so the **public `RaftNode` API is fu
 
 ## Transports: running across machines
 
-The in-memory transport is for tests on one process. For a real cluster use `NanoMsgBusTransport` (package `RaftCs.Transport.NanoMsg`), a managed nanomsg/NNG **BUS** transport over tcp/tls/ipc/ws/inproc. Each node binds a local endpoint and dials its peers; the consensus layer filters frames by recipient id.
+The in-memory transport is for tests on one process. For a cluster that needs encrypted links with authenticated Raft member identities, use `TlsRaftTransport` from `RaftCs.Transport`. Give each member its own certificate and private key usable for both client and server TLS. Configure each remote member with a TCP endpoint and its public leaf certificate:
+
+```csharp
+using System.Net;
+using Raft.Transport;
+
+await using var transport = new TlsRaftTransport(
+    memberId: 1,
+    listenEndPoint: new IPEndPoint(IPAddress.Any, 5560),
+    localCertificate,
+    peers: [new TlsRaftPeer(2, new IPEndPoint(IPAddress.Parse("10.0.0.2"), 5560), peer2Certificate)]);
+await using var node = new RaftNode(config, storage, transport);
+await node.StartAsync();
+```
+
+The transport authenticates both TLS endpoints, matches each remote leaf to a configured member, and accepts only frames from that member to the local node. Pins and endpoints are fixed for the transport's lifetime; replace the transport to change them. The caller owns the local certificate and keeps it alive through disposal. Supply `TlsRaftTransportOptions.ValidatePeerCertificate` for extra trust or revocation policy from your certificate provider. The callback runs synchronously and may run concurrently, so use local or prevalidated data.
+
+By default the transport allows 16 pending inbound TLS handshakes, one inbound and one outbound stream per peer, eight queued outbound frames per peer plus one active send, and messages up to 4 MiB. The five-second I/O deadline covers each handshake (including outbound connect), complete frame read or write, and idle inbound stream. Set `MaxFrameLength` high enough for your largest replication message or snapshot. A full outbound queue fails immediately; network failures drop the in-flight frame and Raft handles retransmission. `FrameReceived` runs per peer; subscribers must return promptly and support concurrent calls.
+
+Alternatively, `NanoMsgBusTransport` (package `RaftCs.Transport.NanoMsg`) provides a managed nanomsg/NNG **BUS** transport over tcp/tls/ipc/ws/inproc. Each node binds a local endpoint and dials its peers; the consensus layer filters frames by recipient id.
 
 ```csharp
 using Raft.Transport.NanoMsg;
